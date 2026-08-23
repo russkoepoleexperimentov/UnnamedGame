@@ -36,8 +36,11 @@ internal struct ClosestHitExcluding(CollidableReference self) : IRayHitHandler
 public sealed class Character
 {
     public const float Radius = 0.4f;
-    public const float CylinderHalfLength = 0.6f;   // total height = 2 * (Radius + HalfLength) = 2.0
-    public const float EyeHeight = 0.72f;           // above the capsule centre
+    public const float CylinderHalfLength = 0.6f;        // standing: total height = 2 * (Radius + this) = 2.0
+    public const float CrouchCylinderHalfLength = 0.15f; // crouched: total height = 1.1
+    public const float EyeHeight = 0.72f;                // above the capsule centre, standing
+    public const float CrouchEyeHeight = 0.30f;
+    public const float CrouchSpeed = 3.2f;
 
     // Tuned to feel close to HL2: 320 u/s ≈ 8 m/s at 40 units per metre.
     public const float MaxGroundSpeed = 8.0f;
@@ -50,16 +53,29 @@ public sealed class Character
     public const float MaxGroundSlopeCos = 0.7f;    // ≈ 45°
     public const float MaxStepHeight = 0.55f;       // tallest ledge the player walks up
     public const float GroundSnapDistance = 0.6f;   // how far below the feet ground still counts
-    public const float StepSmoothTime = 0.09f;      // how long the camera takes to catch up
+    public const float ViewSmoothTime = 0.12f;      // roughly how long the camera takes to catch up
+    public const float ViewCatchUpMin = 1.0f;       // m/s, so tiny offsets still finish promptly
+    public const float ViewCatchUpMax = 5.0f;       // m/s ceiling: this is what keeps it from snapping
+    public const float MaxViewOffset = 1.2f;
 
     private readonly PhysicsWorld _physics;
     private BodyHandle _handle;
     private float _coyoteTimer;
     private float _jumpBufferTimer;
     private Vector3 _previousPosition;
-    private float _stepOffset;   // how far the camera still trails the capsule after a step up or down
+    /// <summary>
+    /// World-space vertical lag of the camera behind the body. Anything that moves the eye
+    /// instantly — a step up or down, ducking, standing up — adds the jump to this offset,
+    /// which then decays to zero. That is the whole of the view smoothing.
+    /// </summary>
+    private float _viewOffset;
     private bool _wasOnGround;
     private float _snapCooldown;   // suppresses ground snapping right after a jump
+    private float _jumpTimer;      // keeps the player airborne while the jump clears the ground probe
+    private Vector3 _flyPosition;
+    private Vector3 _noclipVelocity;
+    private float _halfLength = CylinderHalfLength;   // current cylinder half length
+    private TypedIndex _standingShape, _crouchedShape;
 
     public bool OnGround { get; private set; }
     public Vector3 GroundNormal { get; private set; } = Vector3.UnitY;
@@ -72,7 +88,9 @@ public sealed class Character
     {
         _physics = physics;
         var capsule = new Capsule(Radius, CylinderHalfLength * 2f);
-        var shape = physics.Simulation.Shapes.Add(capsule);
+        _standingShape = physics.Simulation.Shapes.Add(capsule);
+        _crouchedShape = physics.Simulation.Shapes.Add(new Capsule(Radius, CrouchCylinderHalfLength * 2f));
+        var shape = _standingShape;
 
         var inertia = capsule.ComputeInertia(75f);
         inertia.InverseInertiaTensor = default;   // never let the capsule tip over
@@ -86,17 +104,30 @@ public sealed class Character
     /// <summary>False while the player is riding in a vehicle: the capsule is out of the simulation.</summary>
     public bool IsActive { get; private set; } = true;
 
+    /// <summary>True while the capsule is in its short form.</summary>
+    public bool IsCrouching { get; private set; }
+
+    /// <summary>Half the capsule's total height, which changes with the crouch.</summary>
+    public float HalfHeight => _halfLength + Radius;
+
+    /// <summary>Free flight with no collision; the capsule leaves the simulation while it is on.</summary>
+    public bool Noclip { get; private set; }
+    public const float NoclipSpeed = 14f;
+
     public BodyReference Body => _physics.Simulation.Bodies[_handle];
-    public Vector3 Position => Body.Pose.Position;
-    public Vector3 Velocity => Body.Velocity.Linear;
-    public Vector3 EyePosition => Position + new Vector3(0, EyeHeight, 0);
+    public Vector3 Position => Noclip ? _flyPosition : Body.Pose.Position;
+    public Vector3 Velocity => Noclip ? _noclipVelocity : Body.Velocity.Linear;
+    /// <summary>Eye height above the capsule centre for the current stance.</summary>
+    public float EyeAboveCentre => IsCrouching ? CrouchEyeHeight : EyeHeight;
+
+    public Vector3 EyePosition => Position + new Vector3(0, EyeAboveCentre, 0);
 
     /// <summary>
     /// Eye position for rendering: the pose is interpolated across the fixed timestep,
     /// and a step up is eased in rather than snapping the camera a whole stair up.
     /// </summary>
     public Vector3 InterpolatedEyePosition(float alpha)
-        => Vector3.Lerp(_previousPosition, Position, alpha) + new Vector3(0, EyeHeight - _stepOffset, 0);
+        => Vector3.Lerp(_previousPosition, Position, alpha) + new Vector3(0, EyeAboveCentre - _viewOffset, 0);
 
     public Vector3 Forward => new(-MathF.Sin(Yaw) * MathF.Cos(Pitch), MathF.Sin(Pitch), -MathF.Cos(Yaw) * MathF.Cos(Pitch));
     public Vector3 FlatForward => new(-MathF.Sin(Yaw), 0, -MathF.Cos(Yaw));
@@ -109,18 +140,107 @@ public sealed class Character
         Pitch = Math.Clamp(Pitch + deltaPitch, -1.55f, 1.55f);
     }
 
-    /// <param name="wish">Local move input: X = right, Y = forward, each in [-1, 1].</param>
-    public void Move(Vector2 wish, bool jumpHeld, float dt)
+    /// <summary>
+    /// Swaps the capsule between its standing and crouched shapes, keeping the feet planted.
+    /// Standing back up is refused while there is something overhead, so the player stays
+    /// crouched until they leave the low spot — the behaviour every shooter uses.
+    /// </summary>
+    private void UpdateCrouch(bool wantsCrouch)
     {
+        bool target = wantsCrouch || (IsCrouching && !CanStandUp());
+        if (target == IsCrouching) return;
+
+        float delta = CylinderHalfLength - CrouchCylinderHalfLength;
+
+        // On the ground the feet stay planted and the body shrinks downwards. In the air it is
+        // the other way round: the head keeps its height and the feet come up, which is what
+        // lets a crouch-jump clear a ledge a normal jump cannot. Source does exactly this.
+        float shift = OnGround ? (target ? -delta : delta) : (target ? delta : -delta);
+
+        if (!OnGround && target && Blocked(Vector3.UnitY, delta + 0.05f))
+            shift = -delta;   // ceiling in the way: fall back to keeping the feet planted
+
+        float eyeBefore = Body.Pose.Position.Y + EyeAboveCentre;
+
+        var body = Body;
+        body.Pose.Position += new Vector3(0, shift, 0);
+        _previousPosition.Y += shift;   // the swap is instant; do not interpolate through it
+
+        _physics.Simulation.Bodies.SetShape(_handle, target ? _crouchedShape : _standingShape);
+
+        IsCrouching = target;
+        _halfLength = target ? CrouchCylinderHalfLength : CylinderHalfLength;
+
+        // Whatever the eye just did instantly, the camera undoes and then eases back in.
+        float eyeAfter = body.Pose.Position.Y + EyeAboveCentre;
+        _viewOffset = Math.Clamp(_viewOffset + (eyeAfter - eyeBefore), -MaxViewOffset, MaxViewOffset);
+    }
+
+    /// <summary>
+    /// Room to return to full height. Standing on the ground grows the hull upwards; standing
+    /// up in mid-air grows it downwards, because there the head is what stays put.
+    /// </summary>
+    private bool CanStandUp()
+    {
+        float needed = 2f * (CylinderHalfLength + Radius) - HalfHeight;
+        return !Blocked(OnGround ? Vector3.UnitY : -Vector3.UnitY, needed);
+    }
+
+    /// <summary>True when something is in the way within <paramref name="distance"/>.</summary>
+    private bool Blocked(Vector3 direction, float distance)
+        => CastRay(Body.Pose.Position, direction, distance, out _, out _);
+
+    /// <summary>Turns free flight on or off, taking the capsule in and out of the simulation.</summary>
+    public void SetNoclip(bool enabled)
+    {
+        if (enabled == Noclip) return;
+
+        if (enabled)
+        {
+            _flyPosition = Position;
+            _previousPosition = _flyPosition;
+            _noclipVelocity = Vector3.Zero;
+            Disable();
+            Noclip = true;
+        }
+        else
+        {
+            Noclip = false;
+            Enable(_flyPosition);
+        }
+    }
+
+    /// <param name="wish">Local move input: X = right, Y = forward, each in [-1, 1].</param>
+    /// <param name="vertical">Up/down input, only used in noclip.</param>
+    public void Move(Vector2 wish, bool jumpHeld, float dt, float vertical = 0f, bool fast = false, bool crouch = false)
+    {
+        if (Noclip)
+        {
+            MoveNoclip(wish, vertical, fast, dt);
+            return;
+        }
+
+        UpdateCrouch(crouch);
+
         var body = Body;
         var velocity = body.Velocity.Linear;
 
         // Sampled before the solver integrates, so rendering can interpolate towards the new pose.
         _previousPosition = body.Pose.Position;
-        _stepOffset *= MathF.Pow(0.0001f, dt / StepSmoothTime);
-        if (MathF.Abs(_stepOffset) < 0.001f) _stepOffset = 0;
+        // Catch up at a bounded speed rather than a fixed fraction per step: an exponential
+        // decay fast enough for stairs moves a crouch's 0.87 m almost instantly, which reads
+        // as a snap. Source clamps the rate for the same reason.
+        float catchUp = Math.Clamp(MathF.Abs(_viewOffset) / ViewSmoothTime, ViewCatchUpMin, ViewCatchUpMax);
+        float move = MathF.Min(MathF.Abs(_viewOffset), catchUp * dt);
+        _viewOffset -= MathF.Sign(_viewOffset) * move;
+        if (MathF.Abs(_viewOffset) < 0.001f) _viewOffset = 0;
 
         ProbeGround(body.Pose.Position);
+
+        // The ground probe reaches 0.18 m past the feet, so for the first moments of a jump it
+        // still reports ground - and ClipToGroundPlane would then wipe out the upward velocity.
+        _jumpTimer = MathF.Max(0f, _jumpTimer - dt);
+        if (_jumpTimer > 0f) OnGround = false;
 
         if (jumpHeld) _jumpBufferTimer = 0.12f;
         _coyoteTimer = OnGround ? 0.1f : MathF.Max(0, _coyoteTimer - dt);
@@ -129,7 +249,7 @@ public sealed class Character
         var wishDirection = FlatRight * wish.X + FlatForward * wish.Y;
         float wishLength = wishDirection.Length();
         if (wishLength > 1e-4f) wishDirection /= wishLength;
-        float wishSpeed = MathF.Min(wishLength, 1f) * MaxGroundSpeed;
+        float wishSpeed = MathF.Min(wishLength, 1f) * (IsCrouching ? CrouchSpeed : MaxGroundSpeed);
 
         if (OnGround)
         {
@@ -143,6 +263,7 @@ public sealed class Character
                 _coyoteTimer = 0;
                 _jumpBufferTimer = 0;
                 _snapCooldown = 0.15f;   // do not glue the player back down mid-jump
+                _jumpTimer = 0.12f;
             }
             else
             {
@@ -180,7 +301,7 @@ public sealed class Character
     {
         if (IsActive) return;
 
-        var capsule = new Capsule(Radius, CylinderHalfLength * 2f);
+        var capsule = new Capsule(Radius, _halfLength * 2f);
         var shape = _physics.Simulation.Shapes.Add(capsule);
         var inertia = capsule.ComputeInertia(75f);
         inertia.InverseInertiaTensor = default;
@@ -191,17 +312,41 @@ public sealed class Character
 
         IsActive = true;
         _previousPosition = position;
-        _stepOffset = 0;
+        _viewOffset = 0;
         _wasOnGround = false;
         _snapCooldown = 0;
     }
 
+    /// <summary>Free flight: the view direction drives movement, so looking up flies up.</summary>
+    private void MoveNoclip(Vector2 wish, float vertical, bool fast, float dt)
+    {
+        _previousPosition = _flyPosition;
+
+        var direction = Forward * wish.Y + FlatRight * wish.X + Vector3.UnitY * vertical;
+        float length = direction.Length();
+        if (length > 1e-4f) direction /= length;
+
+        _noclipVelocity = direction * (NoclipSpeed * (fast ? 3f : 1f));
+        _flyPosition += _noclipVelocity * dt;
+
+        OnGround = false;
+        _viewOffset = 0f;
+        _coyoteTimer = 0f;
+    }
+
     public void Teleport(Vector3 position)
     {
+        if (Noclip)
+        {
+            _flyPosition = position;
+            _previousPosition = position;
+            return;
+        }
+
         var body = Body;
         body.Pose.Position = position;
         _previousPosition = position;
-        _stepOffset = 0;
+        _viewOffset = 0;
         _wasOnGround = false;
         _snapCooldown = 0;
         body.Velocity.Linear = Vector3.Zero;
@@ -264,7 +409,7 @@ public sealed class Character
     {
         var body = Body;
         var position = body.Pose.Position;
-        float halfHeight = CylinderHalfLength + Radius;
+        float halfHeight = HalfHeight;
 
         if (!CastRay(position, -Vector3.UnitY, halfHeight + GroundSnapDistance, out float t, out var normal)) return;
         if (normal.Y <= MaxGroundSlopeCos) return;
@@ -275,7 +420,7 @@ public sealed class Character
 
         body.Pose.Position = new Vector3(position.X, targetY, position.Z);
         _previousPosition.Y -= drop;
-        _stepOffset = Math.Clamp(_stepOffset - drop, -MaxStepHeight, MaxStepHeight);
+        _viewOffset = Math.Clamp(_viewOffset - drop, -MaxStepHeight, MaxStepHeight);
 
         OnGround = true;
         GroundNormal = normal;
@@ -295,7 +440,7 @@ public sealed class Character
 
         var body = Body;
         var position = body.Pose.Position;
-        float feetY = position.Y - (CylinderHalfLength + Radius);
+        float feetY = position.Y - HalfHeight;
 
         // Is a wall-like surface in the way, just above the feet?
         var shin = new Vector3(position.X, feetY + 0.1f, position.Z);
@@ -314,18 +459,18 @@ public sealed class Character
         if (rise <= 0.02f || rise > MaxStepHeight) return;
 
         // Refuse the step if the player would not fit standing on that surface.
-        float height = 2f * (CylinderHalfLength + Radius);
+        float height = 2f * HalfHeight;
         var surfacePoint = new Vector3(probe.X, surfaceY + 0.05f, probe.Z);
         if (CastRay(surfacePoint, Vector3.UnitY, height - 0.05f, out _, out _)) return;
 
         // Placed absolutely rather than by an increment: repeated attempts across substeps
         // then converge on standing exactly on the tread instead of stacking lift on lift.
-        float targetY = surfaceY + CylinderHalfLength + Radius + 0.01f;
+        float targetY = surfaceY + HalfHeight + 0.01f;
         float lift = targetY - position.Y;
         if (lift <= 0.01f) return;
         body.Pose.Position = new Vector3(position.X, targetY, position.Z);
         _previousPosition.Y += lift;      // the lift is instant, so do not interpolate through it
-        _stepOffset = Math.Clamp(_stepOffset + lift, -MaxStepHeight, MaxStepHeight);
+        _viewOffset = Math.Clamp(_viewOffset + lift, -MaxStepHeight, MaxStepHeight);
         if (velocity.Y < 0) velocity.Y = 0;
 
         // Standing on the tread now: keep ground acceleration and friction for the next
@@ -357,7 +502,7 @@ public sealed class Character
     private void ProbeGround(Vector3 position)
     {
         // Cast from the capsule centre down past the bottom cap.
-        float maximumT = CylinderHalfLength + Radius + 0.18f;
+        float maximumT = HalfHeight + 0.18f;
         bool hit = CastRay(position, -Vector3.UnitY, maximumT, out _, out var normal, out var collidable);
 
         OnGround = hit && normal.Y > MaxGroundSlopeCos;

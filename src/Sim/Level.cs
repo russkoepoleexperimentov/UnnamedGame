@@ -85,6 +85,11 @@ public sealed class Level
                 new Vector3(4, height, 0.55f), PillarColor, checker: false, Surface.Metal);
         }
 
+        // A low slab to crawl under: 1.25 m of clearance, so it needs a crouch.
+        AddStatic(physics, new Vector3(5f, 1.45f, 5f), new Vector3(6, 0.4f, 3), WallColor, checker: true);
+        AddStatic(physics, new Vector3(2.2f, 0.625f, 5f), new Vector3(0.4f, 1.25f, 3), PillarColor, checker: false);
+        AddStatic(physics, new Vector3(7.8f, 0.625f, 5f), new Vector3(0.4f, 1.25f, 3), PillarColor, checker: false);
+
         // Free-standing cover blocks.
         AddStatic(physics, new Vector3(-6, 1, 6), new Vector3(4, 2, 4), WallColor, checker: true);
         AddStatic(physics, new Vector3(4, 0.75f, -4), new Vector3(6, 1.5f, 3), WallColor, checker: true);

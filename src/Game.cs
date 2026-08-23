@@ -18,6 +18,7 @@ public sealed class Game : IDisposable
 
     private const int VK_ESCAPE = 0x1B, VK_SPACE = 0x20, VK_SHIFT = 0x10, VK_R = 0x52, VK_F = 0x46, VK_L = 0x4C, VK_E = 0x45;
     private const int VK_TILDE = 0xC0;   // the ` / ~ key, and ё on a Russian layout
+    private const int VK_CONTROL = 0x11;
     private static readonly int[] ConsoleKeys = [0x21, 0x22, 0x26, 0x28];   // PgUp, PgDn, Up, Down
 
     /// <summary>Driver's eye, relative to the chassis centre: left-hand drive, just behind the wheel.</summary>
@@ -45,6 +46,13 @@ public sealed class Game : IDisposable
     private readonly FontAtlas _font;
     private readonly UiBatch _ui;
     private readonly Cvar _playerDebug;
+    private readonly ViewEffects _view = new();
+    private Cvar _bobScale, _carSway;
+
+    // While driving these are the aim relative to the car, so the view turns with it.
+    private float _carLookYaw, _carLookPitch;
+    private Vector3 _viewForward = -Vector3.UnitZ;
+    private Vector3 _viewRight = Vector3.UnitX;
     private float _measuredFps;
     private bool _flashlightOn = true;
     private float _time;
@@ -66,6 +74,8 @@ public sealed class Game : IDisposable
         _font = _renderer.CreateFont();
         _ui = new UiBatch(_font);
         _playerDebug = _console.RegisterCvar("player_debug", 0f, "0/1 overlay: position, speed, surface, state");
+        _bobScale = _console.RegisterCvar("cl_bob", 1f, "head bob while walking, 0 disables");
+        _carSway = _console.RegisterCvar("cl_carsway", 1f, "camera inertia in the car, 0 disables");
         RegisterConsoleCommands();
 
         _audio = new AudioEngine();
@@ -82,6 +92,7 @@ public sealed class Game : IDisposable
         Console.WriteLine($"audio: {(_audio.IsAvailable ? "XAudio2" : "disabled")}, " +
                           $"{_sounds.LoadedFootstepClips} footstep clips");
 
+        LoadConfig();
         _console.Print("UnnamedGame console. Type help for commands, ~ to close.");
         _console.Print($"car loaded: {model.Parts.Count} parts, audio: " +
                        $"{(_audio.IsAvailable ? "XAudio2" : "disabled")}");
@@ -155,6 +166,7 @@ public sealed class Game : IDisposable
             HandleInput(frameTime);
             StepSimulation(frameTime);
             UpdateAudio(frameTime);
+            UpdateViewEffects(frameTime);
             _console.Update(frameTime);
             // Whatever time is left over in the accumulator is how far past the last
             // simulated state we are; render that fraction of the way to the current one.
@@ -206,11 +218,51 @@ public sealed class Game : IDisposable
             _console.Print($"moved to the car at {Format(_car.Position)}");
         }, "walk over to the car");
 
+        _console.RegisterCommand("noclip", _ =>
+        {
+            if (_driving) { _console.PrintError("noclip: get out of the car first"); return; }
+            _player.SetNoclip(!_player.Noclip);
+            _console.Print(_player.Noclip
+                ? "noclip ON - space/ctrl to rise and sink, shift to sprint"
+                : "noclip OFF");
+        }, "toggle free flight through geometry");
+
+        _console.RegisterCommand("saveconfig", _ =>
+        {
+            _console.SaveConfig(AssetPaths.ConfigFile);
+            _console.Print($"wrote {AssetPaths.ConfigFile}");
+        }, "write variables and bindings to config.cfg");
+
         _console.RegisterCommand("pos", _ =>
         {
             var position = _driving ? _car.Position : _player.Position;
             _console.Print($"{(_driving ? "car" : "player")} {Format(position)}  yaw {_player.Yaw:F2}");
         }, "print the current position");
+    }
+
+    /// <summary>Runs config.cfg at startup, creating a starter one the first time.</summary>
+    private void LoadConfig()
+    {
+        if (!File.Exists(AssetPaths.ConfigFile))
+        {
+            File.WriteAllLines(AssetPaths.ConfigFile,
+            [
+                "// UnnamedGame config - executed at startup, rewritten on exit.",
+                "// Edit freely; comments outside this header are not preserved.",
+                "",
+                "player_debug 0",
+                "snd_volume 0.8",
+                "timescale 1",
+                "",
+                "bind f1 player_debug 1",
+                "bind f2 player_debug 0",
+                "bind n noclip",
+                "bind b spawn 5",
+                "bind r respawn",
+            ]);
+        }
+
+        _console.ExecuteFile(AssetPaths.ConfigFile);
     }
 
     private static float ParseFloat(string text)
@@ -238,6 +290,11 @@ public sealed class Game : IDisposable
 
         _audio.SetMasterVolume(_console.Find("snd_volume").Value);
 
+        // Bindings fire on the frame the key goes down, console closed only.
+        foreach (var (key, command) in _console.Bindings)
+            if (_window.WasKeyPressed(key))
+                _console.Execute(command);
+
         if (_window.WasKeyPressed(VK_ESCAPE))
             _window.SetMouseCapture(!_window.MouseCaptured);
 
@@ -247,13 +304,21 @@ public sealed class Game : IDisposable
             return;
         }
 
-        _player.Look(-_window.MouseDeltaX * MouseSensitivity, -_window.MouseDeltaY * MouseSensitivity);
+        float lookYaw = -_window.MouseDeltaX * MouseSensitivity;
+        float lookPitch = -_window.MouseDeltaY * MouseSensitivity;
+        if (_driving)
+        {
+            // Aim is stored relative to the car, so steering carries the view round with it.
+            _carLookYaw = MathF.IEEERemainder(_carLookYaw + lookYaw, MathF.Tau);
+            _carLookPitch = Math.Clamp(_carLookPitch + lookPitch, -1.2f, 1.2f);
+        }
+        else
+        {
+            _player.Look(lookYaw, lookPitch);
+        }
 
         if (_window.WasKeyPressed(VK_E))
             ToggleVehicle();
-
-        if (!_driving && _window.WasKeyPressed(VK_R))
-            _player.Teleport(_level.SpawnPoint);
 
         if (_window.WasKeyPressed(VK_L))
             _flashlightOn = !_flashlightOn;
@@ -280,14 +345,22 @@ public sealed class Game : IDisposable
             var exit = IsFree(left) ? left : IsFree(right) ? right : _car.Position + Vector3.UnitY * 2.2f;
 
             _player.Enable(exit + new Vector3(0, Character.CylinderHalfLength + Character.Radius, 0));
+
+            // Carry the direction the driver was looking in out of the car with them.
+            _player.Yaw = MathF.Atan2(-_viewForward.X, -_viewForward.Z);
+            _player.Pitch = MathF.Asin(Math.Clamp(_viewForward.Y, -1f, 1f));
             _driving = false;
+            _view.ResetVehicle();
             return;
         }
 
         if (Vector3.Distance(_player.Position, _car.Position) > EnterDistance) return;
+        _player.SetNoclip(false);
         _player.Disable();
-        _player.Yaw = _car.Yaw;   // start out looking where the car is pointing
+        _carLookYaw = 0f;         // start out looking straight down the bonnet
+        _carLookPitch = 0f;
         _driving = true;
+        _view.ResetVehicle();
     }
 
     /// <summary>Rough check that a capsule would fit where the player is about to be put.</summary>
@@ -304,7 +377,10 @@ public sealed class Game : IDisposable
             (_window.IsKeyDown(VK_D) ? 1 : 0) - (_window.IsKeyDown(VK_A) ? 1 : 0),
             (_window.IsKeyDown(VK_W) ? 1 : 0) - (_window.IsKeyDown(VK_S) ? 1 : 0));
         bool jump = _window.IsKeyDown(VK_SPACE);
-        if (!_window.MouseCaptured || _console.IsOpen) { wish = Vector2.Zero; jump = false; }
+        float vertical = (_window.IsKeyDown(VK_SPACE) ? 1 : 0) - (_window.IsKeyDown(VK_CONTROL) ? 1 : 0);
+        bool sprint = _window.IsKeyDown(VK_SHIFT);
+        bool crouch = _window.IsKeyDown(VK_CONTROL);
+        if (!_window.MouseCaptured || _console.IsOpen) { wish = Vector2.Zero; jump = false; vertical = 0f; crouch = false; }
         _driveThrottle = wish.Y;
 
         // Fixed timestep keeps the movement curves and the solver deterministic.
@@ -319,7 +395,7 @@ public sealed class Game : IDisposable
             if (_driving)
                 _car.Update(wish.Y, wish.X, jump, FixedTimestep);
             else
-                _player.Move(wish, jump, FixedTimestep);
+                _player.Move(wish, jump, FixedTimestep, vertical, sprint, crouch);
 
             _physics.Step(FixedTimestep);
         }
@@ -333,13 +409,19 @@ public sealed class Game : IDisposable
             props[i].PreviousPose = _physics.Simulation.Bodies[props[i].Handle].Pose;
     }
 
+    private void UpdateViewEffects(float frameTime)
+    {
+        if (_driving)
+            _view.UpdateVehicle(_car.Velocity, _car.Forward, _car.Right, _carSway.Value, frameTime);
+        else
+            _view.UpdateWalk(_player.Velocity, _player.OnGround && !_player.Noclip, _bobScale.Value, frameTime);
+    }
+
     /// <summary>Places the listener, then lets the sound logic follow the simulation state.</summary>
     private void UpdateAudio(float frameTime)
     {
-        var forward = _player.Forward;
-        var right = Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY));
         var listener = _driving ? Vector3.Transform(SeatOffset, _car.ChassisMatrix()) : _player.EyePosition;
-        _audio.SetListener(listener, right);
+        _audio.SetListener(listener, _viewRight);
 
         if (_driving)
             _sounds.SuspendFootsteps();
@@ -354,11 +436,40 @@ public sealed class Game : IDisposable
     private void Render(float alpha)
     {
         var chassis = _car.InterpolatedChassisMatrix(alpha);
-        var eye = _driving
-            ? Vector3.Transform(SeatOffset, chassis)
-            : _player.InterpolatedEyePosition(alpha);
-        var forward = _player.Forward;
-        var view = Matrix4x4.CreateLookAt(eye, eye + forward, Vector3.UnitY);
+        Vector3 eye, forward, up;
+
+        if (_driving)
+        {
+            // The camera lives in the car's frame: its yaw, pitch and roll all come along, and
+            // the mouse only adds an offset on top. Looking ahead means ahead down the bonnet.
+            var carForward = Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitZ, chassis));
+            var carRight = Vector3.Normalize(Vector3.TransformNormal(-Vector3.UnitX, chassis));
+            var carUp = Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitY, chassis));
+
+            float yaw = _carLookYaw;
+            float pitch = Math.Clamp(_carLookPitch + _view.CarPitch, -1.35f, 1.35f);
+            forward = ViewEffects.CarLookDirection(carForward, carRight, carUp, yaw, pitch);
+
+            up = carUp;
+            eye = Vector3.Transform(SeatOffset + new Vector3(-_view.CarOffset.X, _view.CarOffset.Y, _view.CarOffset.Z), chassis);
+            up = RollAround(up, forward, _view.CarRoll);
+        }
+        else
+        {
+            eye = _player.InterpolatedEyePosition(alpha);
+            forward = _player.Forward;
+            var right = Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY));
+            var viewUp = Vector3.Cross(right, forward);
+
+            // Bob rides in view space so it leans with wherever the player is looking.
+            eye += right * _view.WalkOffset.X + viewUp * _view.WalkOffset.Y + forward * _view.WalkOffset.Z;
+            up = RollAround(Vector3.UnitY, forward, _view.WalkRoll);
+        }
+
+        _viewForward = forward;
+        _viewRight = Vector3.Normalize(Vector3.Cross(forward, up));
+
+        var view = Matrix4x4.CreateLookAt(eye, eye + forward, up);
         var projection = Matrix4x4.CreatePerspectiveFieldOfView(
             75f * MathF.PI / 180f, _renderer.AspectRatio, 0.05f, 300f);
 
@@ -404,14 +515,16 @@ public sealed class Game : IDisposable
         {
             spotlight = _driving
                 ? Spotlight.Headlights(Vector3.Transform(new Vector3(0f, -0.12f, 2.2f), chassis), _car.Forward)
-                : Spotlight.Flashlight(
-                    eye + Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY)) * 0.18f - new Vector3(0, 0.12f, 0),
-                    forward);
+                : Spotlight.Flashlight(eye + _viewRight * 0.18f - new Vector3(0, 0.12f, 0), forward);
         }
 
         BuildUi();
         _renderer.RenderFrame(_scene, _glass, _ui, _level.UpdateLights(_time), spotlight, view, projection, eye);
     }
+
+    /// <summary>Tilts an up vector around the view axis.</summary>
+    private static Vector3 RollAround(Vector3 up, Vector3 forward, float angle)
+        => angle == 0f ? up : Vector3.Normalize(Vector3.Transform(up, Matrix4x4.CreateFromAxisAngle(forward, angle)));
 
     /// <summary>Queues the car: the shell rides the chassis, each wheel gets its own transform.</summary>
     private void AddCar(in Matrix4x4 chassis)
@@ -466,7 +579,6 @@ public sealed class Game : IDisposable
         var value = new Vector4(0.95f, 0.95f, 0.88f, 1f);
         var panel = new Vector4(0.02f, 0.03f, 0.05f, 0.55f);
 
-        var forward = _player.Forward;
         bool onGround = _player.OnGround;
         var position = _driving ? _car.Position : _player.Position;
         var velocity = _driving ? _car.Velocity : _player.Velocity;
@@ -474,18 +586,22 @@ public sealed class Game : IDisposable
 
         string state = _driving
             ? (_car.Wheels.ToArray().Count(w => w.OnGround) is var wheels && wheels > 0 ? $"driving ({wheels}/4 wheels down)" : "driving (airborne)")
-            : onGround ? "on foot (ground)" : "on foot (air)";
-        string surface = _driving ? "-" : _level.SurfaceOf(_player.GroundCollidable).ToString();
+            : _player.Noclip ? "noclip (no collision)"
+            : $"on foot ({(_player.IsCrouching ? "crouched, " : "")}{(onGround ? "ground" : "air")})";
+        string surface = _driving || _player.Noclip
+            ? "-"
+            : _level.SurfaceOf(_player.GroundCollidable).ToString();
 
         (string Label, string Value)[] rows =
         [
             ("position", Format(position)),
             ("velocity", $"{Format(velocity)}"),
             ("speed", $"{horizontal,6:F2} m/s horizontal   {velocity.Length(),6:F2} m/s total   {horizontal * 3.6f,6:F1} km/h"),
-            ("facing", $"yaw {_player.Yaw * 180f / MathF.PI,7:F1} pitch {_player.Pitch * 180f / MathF.PI,6:F1} (deg)   dir {Format(forward)}"),
+            ("facing", $"yaw {MathF.Atan2(-_viewForward.X, -_viewForward.Z) * 180f / MathF.PI,7:F1} " +
+                       $"pitch {MathF.Asin(Math.Clamp(_viewForward.Y, -1f, 1f)) * 180f / MathF.PI,6:F1} (deg)   dir {Format(_viewForward)}"),
             ("state", state),
             ("surface", surface),
-            ("ground", _driving ? "-" : $"normal {Format(_player.GroundNormal)}"),
+            ("ground", _driving || _player.Noclip ? "-" : $"normal {Format(_player.GroundNormal)}"),
             ("frame", $"{_measuredFps,5:F1} fps   bodies {_level.Dynamics.Count}   lights {_level.LightCount}"),
         ];
 
@@ -540,6 +656,7 @@ public sealed class Game : IDisposable
 
     public void Dispose()
     {
+        _console.SaveConfig(AssetPaths.ConfigFile);
         _font.Dispose();
         _sounds.Dispose();
         _audio.Dispose();

@@ -8,6 +8,9 @@ public static class AssetPaths
 
     public static string Get(params string[] parts) => Path.Combine([Root, .. parts]);
 
+    /// <summary>Config lives next to the assets folder, so it survives rebuilds of bin/.</summary>
+    public static string ConfigFile { get; } = Path.Combine(Directory.GetParent(Root)!.FullName, "config.cfg");
+
     private static string Locate()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
