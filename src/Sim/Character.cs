@@ -51,7 +51,7 @@ public sealed class Character
     public const float StepSmoothTime = 0.09f;      // how long the camera takes to catch up
 
     private readonly PhysicsWorld _physics;
-    private readonly BodyHandle _handle;
+    private BodyHandle _handle;
     private float _coyoteTimer;
     private float _jumpBufferTimer;
     private Vector3 _previousPosition;
@@ -78,6 +78,9 @@ public sealed class Character
         _handle = physics.Simulation.Bodies.Add(description);
         _previousPosition = spawnPosition;
     }
+
+    /// <summary>False while the player is riding in a vehicle: the capsule is out of the simulation.</summary>
+    public bool IsActive { get; private set; } = true;
 
     public BodyReference Body => _physics.Simulation.Bodies[_handle];
     public Vector3 Position => Body.Pose.Position;
@@ -158,6 +161,35 @@ public sealed class Character
 
         body.Velocity.Linear = velocity;
         body.Awake = true;
+    }
+
+    /// <summary>Removes the capsule from the simulation (on entering a vehicle).</summary>
+    public void Disable()
+    {
+        if (!IsActive) return;
+        _physics.Simulation.Bodies.Remove(_handle);
+        IsActive = false;
+    }
+
+    /// <summary>Puts the capsule back at <paramref name="position"/> (on leaving a vehicle).</summary>
+    public void Enable(Vector3 position)
+    {
+        if (IsActive) return;
+
+        var capsule = new Capsule(Radius, CylinderHalfLength * 2f);
+        var shape = _physics.Simulation.Shapes.Add(capsule);
+        var inertia = capsule.ComputeInertia(75f);
+        inertia.InverseInertiaTensor = default;
+
+        var description = BodyDescription.CreateDynamic(position, inertia, shape, 0.01f);
+        description.Activity.SleepThreshold = -1f;
+        _handle = _physics.Simulation.Bodies.Add(description);
+
+        IsActive = true;
+        _previousPosition = position;
+        _stepOffset = 0;
+        _wasOnGround = false;
+        _snapCooldown = 0;
     }
 
     public void Teleport(Vector3 position)

@@ -16,20 +16,24 @@ internal static class Shaders
         row_major float4x4 World;
         float4   Color;
         float3   TexScale;   // world units per checker tile
-        float    Checker;    // 0 = flat color, 1 = checkered
+        float    Checker;    // 0 = flat color, 1 = checkered, 2 = sample AlbedoTexture
     };
 
-    struct VSIn { float3 Position : POSITION; float3 Normal : NORMAL; };
+    struct VSIn { float3 Position : POSITION; float3 Normal : NORMAL; float2 Uv : TEXCOORD0; };
     """;
 
     /// <summary>Geometry pass: albedo into target 0, world normal into target 1, depth into the DSV.</summary>
     public static readonly string GBuffer = Common + """
+
+    Texture2D<float4> AlbedoTexture : register(t0);
+    SamplerState AlbedoSampler : register(s0);
 
     struct VSOut
     {
         float4 Position : SV_POSITION;
         float3 WorldPos : TEXCOORD0;
         float3 Normal   : TEXCOORD1;
+        float2 Uv       : TEXCOORD2;
     };
 
     struct PSOut
@@ -45,6 +49,7 @@ internal static class Shaders
         o.WorldPos = world.xyz;
         o.Position = mul(world, ViewProjection);
         o.Normal   = normalize(mul(float4(input.Normal, 0.0), World).xyz);
+        o.Uv       = input.Uv;
         return o;
     }
 
@@ -53,7 +58,14 @@ internal static class Shaders
         float3 n = normalize(input.Normal);
         float3 albedo = Color.rgb;
 
-        if (Checker > 0.5)
+        if (Checker > 1.5)
+        {
+            // Textured model surface: the material colour tints the sampled albedo.
+            float4 sampled = AlbedoTexture.Sample(AlbedoSampler, input.Uv);
+            clip(sampled.a - 0.35);
+            albedo *= sampled.rgb;
+        }
+        else if (Checker > 0.5)
         {
             // Project onto whichever plane the face normal is least aligned with.
             float3 p = input.WorldPos / max(TexScale, 0.001);
@@ -148,6 +160,14 @@ internal static class Shaders
         return sum / 9.0;
     }
 
+    // Reinhard: without it a light close to a wall clips straight to white.
+    float3 ToneMap(float3 color)
+    {
+        const float exposure = 1.6;
+        color *= exposure;
+        return pow(saturate(color / (1.0 + color)), 1.0 / 2.2);
+    }
+
     float3 Shade(float3 albedo, float3 n, float3 v, float3 lightDirection, float3 radiance)
     {
         float ndotl = saturate(dot(n, lightDirection));
@@ -166,7 +186,7 @@ internal static class Shaders
 
         float3 skyColor = float3(0.20, 0.25, 0.34);
         if (depth >= 1.0)
-            return float4(pow(skyColor, 1.0 / 2.2), 1.0);
+            return float4(ToneMap(skyColor), 1.0);
 
         float3 albedo = GBufferAlbedo.Load(pixel).rgb;
         float3 n = normalize(GBufferNormal.Load(pixel).xyz * 2.0 - 1.0);
@@ -221,7 +241,7 @@ internal static class Shaders
 
         float fog = saturate((length(CameraPosition - worldPos) - 25.0) / 65.0);
         float3 final = lerp(lit, skyColor, fog);
-        return float4(pow(saturate(final), 1.0 / 2.2), 1.0);
+        return float4(ToneMap(final), 1.0);
     }
     """;
 

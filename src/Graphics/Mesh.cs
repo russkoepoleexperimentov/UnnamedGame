@@ -5,10 +5,9 @@ using Vortice.Direct3D11;
 namespace UnnamedGame.Graphics;
 
 [StructLayout(LayoutKind.Sequential)]
-public struct Vertex(Vector3 position, Vector3 normal)
+public record struct Vertex(Vector3 Position, Vector3 Normal, Vector2 Uv)
 {
-    public Vector3 Position = position;
-    public Vector3 Normal = normal;
+    public Vertex(Vector3 position, Vector3 normal) : this(position, normal, Vector2.Zero) { }
 }
 
 public sealed class Mesh : IDisposable
@@ -17,7 +16,7 @@ public sealed class Mesh : IDisposable
     public ID3D11Buffer IndexBuffer { get; }
     public int IndexCount { get; }
 
-    public Mesh(ID3D11Device device, Vertex[] vertices, ushort[] indices)
+    public Mesh(ID3D11Device device, Vertex[] vertices, uint[] indices)
     {
         VertexBuffer = device.CreateBuffer(vertices, BindFlags.VertexBuffer);
         IndexBuffer = device.CreateBuffer(indices, BindFlags.IndexBuffer);
@@ -40,7 +39,7 @@ public sealed class Mesh : IDisposable
         ];
 
         var vertices = new List<Vertex>(24);
-        var indices = new List<ushort>(36);
+        var indices = new List<uint>(36);
 
         foreach (var n in normals)
         {
@@ -50,12 +49,12 @@ public sealed class Mesh : IDisposable
             var bitangent = Vector3.Cross(n, tangent);
             var center = n * 0.5f;
 
-            ushort b = (ushort)vertices.Count;
-            vertices.Add(new Vertex(center - tangent * 0.5f - bitangent * 0.5f, n));
-            vertices.Add(new Vertex(center - tangent * 0.5f + bitangent * 0.5f, n));
-            vertices.Add(new Vertex(center + tangent * 0.5f + bitangent * 0.5f, n));
-            vertices.Add(new Vertex(center + tangent * 0.5f - bitangent * 0.5f, n));
-            indices.AddRange([b, (ushort)(b + 1), (ushort)(b + 2), b, (ushort)(b + 2), (ushort)(b + 3)]);
+            uint b = (uint)vertices.Count;
+            vertices.Add(new Vertex(center - tangent * 0.5f - bitangent * 0.5f, n, new Vector2(0, 0)));
+            vertices.Add(new Vertex(center - tangent * 0.5f + bitangent * 0.5f, n, new Vector2(0, 1)));
+            vertices.Add(new Vertex(center + tangent * 0.5f + bitangent * 0.5f, n, new Vector2(1, 1)));
+            vertices.Add(new Vertex(center + tangent * 0.5f - bitangent * 0.5f, n, new Vector2(1, 0)));
+            indices.AddRange([b, b + 1, b + 2, b, b + 2, b + 3]);
         }
 
         return new Mesh(device, [.. vertices], [.. indices]);
@@ -65,7 +64,7 @@ public sealed class Mesh : IDisposable
     public static Mesh CreateSphere(ID3D11Device device, int slices = 20, int stacks = 12)
     {
         var vertices = new List<Vertex>();
-        var indices = new List<ushort>();
+        var indices = new List<uint>();
 
         for (int stack = 0; stack <= stacks; stack++)
         {
@@ -77,7 +76,7 @@ public sealed class Mesh : IDisposable
                     MathF.Sin(phi) * MathF.Cos(theta),
                     MathF.Cos(phi),
                     MathF.Sin(phi) * MathF.Sin(theta));
-                vertices.Add(new Vertex(n, n));
+                vertices.Add(new Vertex(n, n, new Vector2((float)slice / slices, (float)stack / stacks)));
             }
         }
 
@@ -85,9 +84,9 @@ public sealed class Mesh : IDisposable
         {
             for (int slice = 0; slice < slices; slice++)
             {
-                ushort a = (ushort)(stack * (slices + 1) + slice);
-                ushort b = (ushort)(a + slices + 1);
-                indices.AddRange([a, (ushort)(a + 1), b, (ushort)(a + 1), (ushort)(b + 1), b]);
+                uint a = (uint)(stack * (slices + 1) + slice);
+                uint b = a + (uint)slices + 1;
+                indices.AddRange([a, a + 1, b, a + 1, b + 1, b]);
             }
         }
 

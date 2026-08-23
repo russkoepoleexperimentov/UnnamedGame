@@ -88,6 +88,7 @@ public sealed class Renderer : IDisposable
     private readonly ID3D11DepthStencilState _depthState;
     private readonly ID3D11DepthStencilState _noDepthState;
     private readonly ID3D11SamplerState _shadowSampler;
+    private readonly ID3D11SamplerState _albedoSampler;
 
     private readonly ID3D11Texture2D _sunShadowTexture;
     private readonly ID3D11DepthStencilView _sunShadowView;
@@ -155,6 +156,7 @@ public sealed class Renderer : IDisposable
         [
             new("POSITION", 0, Format.R32G32B32_Float, 0, 0),
             new("NORMAL", 0, Format.R32G32B32_Float, 12, 0),
+            new("TEXCOORD", 0, Format.R32G32_Float, 24, 0),
         ];
         _inputLayout = _device.CreateInputLayout(elements, gbufferVSBlob.AsSpan());
         gbufferVSBlob.Dispose();
@@ -198,12 +200,26 @@ public sealed class Renderer : IDisposable
             MaxLOD = float.MaxValue,
         });
 
+        _albedoSampler = _device.CreateSamplerState(new SamplerDescription
+        {
+            Filter = Filter.Anisotropic,
+            AddressU = TextureAddressMode.Wrap,
+            AddressV = TextureAddressMode.Wrap,
+            AddressW = TextureAddressMode.Wrap,
+            MaxAnisotropy = 8,
+            MinLOD = 0,
+            MaxLOD = float.MaxValue,
+        });
+
         (_sunShadowTexture, _sunShadowView, _sunShadowSrv) = CreateDepthTarget(SunShadowResolution, SunShadowResolution);
         (_spotShadowTexture, _spotShadowView, _spotShadowSrv) = CreateDepthTarget(SpotShadowResolution, SpotShadowResolution);
 
         BoxMesh = Mesh.CreateBox(_device);
         SphereMesh = Mesh.CreateSphere(_device);
     }
+
+    /// <summary>Uploads a loaded model (meshes and textures) to the GPU.</summary>
+    public RenderModel CreateModel(Assets.Model model) => RenderModel.Create(_device, _context, model);
 
     private static Blob Compile(string source, string entryPoint, string profile)
     {
@@ -359,9 +375,10 @@ public sealed class Renderer : IDisposable
         _context.VSSetConstantBuffer(0, _perPass);
         _context.VSSetConstantBuffer(1, _perObject);
         _context.PSSetConstantBuffer(1, _perObject);
+        _context.PSSetSampler(0, _albedoSampler);
 
         Write(_perPass, new PerPassData { ViewProjection = viewProjection });
-        DrawAll(scene);
+        DrawAll(scene, bindTextures: true);
     }
 
     private void LightingPass(in Matrix4x4 viewProjection, in Matrix4x4 sunViewProjection, in Matrix4x4 spotViewProjection,
@@ -438,21 +455,25 @@ public sealed class Renderer : IDisposable
         DrawAll(overlay);
     }
 
-    private void DrawAll(IReadOnlyList<DrawCommand> commands)
+    private void DrawAll(IReadOnlyList<DrawCommand> commands, bool bindTextures = false)
     {
         for (int i = 0; i < commands.Count; i++)
         {
             var command = commands[i];
+            bool textured = bindTextures && command.Texture is not null;
             Write(_perObject, new PerObjectData
             {
                 World = command.World,
                 Color = command.Color,
                 TexScale = command.TexScale,
-                Checker = command.Checker ? 1f : 0f,
+                Checker = textured ? 2f : command.Checker ? 1f : 0f,
             });
 
+            if (bindTextures)
+                _context.PSSetShaderResource(0, textured ? command.Texture.View : null);
+
             _context.IASetVertexBuffer(0, command.Mesh.VertexBuffer, (uint)Unsafe.SizeOf<Vertex>());
-            _context.IASetIndexBuffer(command.Mesh.IndexBuffer, Format.R16_UInt, 0u);
+            _context.IASetIndexBuffer(command.Mesh.IndexBuffer, Format.R32_UInt, 0u);
             _context.DrawIndexed((uint)command.Mesh.IndexCount, 0, 0);
         }
     }
@@ -503,6 +524,7 @@ public sealed class Renderer : IDisposable
         _sunShadowView.Dispose();
         _sunShadowTexture.Dispose();
 
+        _albedoSampler.Dispose();
         _shadowSampler.Dispose();
         _noDepthState.Dispose();
         _depthState.Dispose();

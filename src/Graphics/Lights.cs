@@ -15,14 +15,29 @@ public readonly record struct Spotlight(
     float InnerAngle,
     float OuterAngle)
 {
+    /// <summary>Wider, longer-throwing cone for the car: mounted at the bumper, not the eye.</summary>
+    public static Spotlight Headlights(Vector3 position, Vector3 direction) => new(
+        position, direction,
+        Color: new Vector3(1f, 0.97f, 0.9f),
+        Intensity: 14f,
+        Range: 48f,
+        InnerAngle: 0.26f,
+        OuterAngle: 0.46f);
+
     public static Spotlight Flashlight(Vector3 position, Vector3 direction) => new(
         position, direction,
         Color: new Vector3(1f, 0.96f, 0.86f),
-        Intensity: 9f,
+        Intensity: 7f,
         Range: 34f,
         InnerAngle: 0.20f,
         OuterAngle: 0.34f);
 }
 
 /// <summary>One queued mesh draw. The renderer replays the queue once per pass.</summary>
-public readonly record struct DrawCommand(Mesh Mesh, Matrix4x4 World, Vector4 Color, Vector3 TexScale, bool Checker);
+public readonly record struct DrawCommand(
+    Mesh Mesh,
+    Matrix4x4 World,
+    Vector4 Color,
+    Vector3 TexScale,
+    bool Checker,
+    Texture Texture = null);

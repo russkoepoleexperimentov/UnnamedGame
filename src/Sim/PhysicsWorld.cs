@@ -124,6 +124,14 @@ public sealed class PhysicsWorld : IDisposable
         return Simulation.Bodies.Add(description);
     }
 
+    /// <summary>True if anything at all is hit along the ray.</summary>
+    public bool RayCastAny(Vector3 origin, Vector3 direction, float maximumT)
+    {
+        var handler = new ClosestHitExcluding(default);
+        Simulation.RayCast(origin, direction, maximumT, BufferPool, ref handler, 0);
+        return handler.Hit;
+    }
+
     public void Dispose()
     {
         Simulation.Dispose();

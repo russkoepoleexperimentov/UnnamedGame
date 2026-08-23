@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
+using UnnamedGame.Assets;
 using UnnamedGame.Graphics;
 using UnnamedGame.Platform;
 using UnnamedGame.Sim;
@@ -13,7 +14,11 @@ public sealed class Game : IDisposable
     private const float MouseSensitivity = 0.0022f;
     private const int MaxDynamics = 400;
 
-    private const int VK_ESCAPE = 0x1B, VK_SPACE = 0x20, VK_SHIFT = 0x10, VK_R = 0x52, VK_F = 0x46, VK_L = 0x4C;
+    private const int VK_ESCAPE = 0x1B, VK_SPACE = 0x20, VK_SHIFT = 0x10, VK_R = 0x52, VK_F = 0x46, VK_L = 0x4C, VK_E = 0x45;
+
+    /// <summary>Driver's eye, relative to the chassis centre: left-hand drive, just behind the wheel.</summary>
+    private static readonly Vector3 SeatOffset = new(0.35f, 0.58f, 0.30f);
+    private const float EnterDistance = 3.4f;
     private const int VK_W = 0x57, VK_A = 0x41, VK_S = 0x53, VK_D = 0x44;
 
     private readonly GameWindow _window;
@@ -21,6 +26,11 @@ public sealed class Game : IDisposable
     private readonly PhysicsWorld _physics;
     private readonly Level _level;
     private readonly Character _player;
+    private readonly RenderModel _carModel;
+    private readonly Vehicle _car;
+    private readonly List<RenderModel.Part> _carBodyParts = [];
+    private readonly List<RenderModel.Part>[] _carWheelParts = [[], [], [], []];
+    private bool _driving;
 
     private readonly List<DrawCommand> _scene = [];
     private readonly List<DrawCommand> _overlay = [];
@@ -39,7 +49,60 @@ public sealed class Game : IDisposable
         _physics = new PhysicsWorld(new Vector3(0, -18f, 0));
         _level = new Level(_physics);
         _player = new Character(_physics, _level.SpawnPoint);
+
+        var loadClock = Stopwatch.StartNew();
+        var model = ModelLoader.Load(
+            AssetPaths.Get("models", "vehicles", "lada vaz 2110.fbx"),
+            AssetPaths.Get("textures", "vehicles"));
+        _carModel = _renderer.CreateModel(model);
+        _car = BuildVehicle();
+        Console.WriteLine($"loaded car: {model.Parts.Count} parts, {_carModel.Parts.Count} drawn, " +
+                          $"{model.Materials.Count} materials in {loadClock.ElapsedMilliseconds} ms");
     }
+
+    /// <summary>
+    /// Splits the loaded model into a rigid body group and the four wheels, and takes the
+    /// suspension anchors straight from the wheel nodes so the physics matches the model.
+    /// </summary>
+    private Vehicle BuildVehicle()
+    {
+        var hubs = new Vector3[4];
+        var found = new bool[4];
+
+        foreach (var part in _carModel.Parts)
+        {
+            int wheel = WheelIndex(part.NodeName);
+            if (wheel < 0)
+            {
+                _carBodyParts.Add(part);
+                continue;
+            }
+
+            _carWheelParts[wheel].Add(part);   // a wheel is several parts: tyre, rim, brake disc
+            hubs[wheel] = part.Transform.Translation;
+            found[wheel] = true;
+        }
+
+        if (Array.IndexOf(found, false) >= 0)
+            throw new InvalidDataException("The car model is missing one of its KAMA_E224 wheel nodes.");
+
+        // Anchors sit at chassis-centre height; the hub hangs SuspensionRest below at rest.
+        float centreHeight = hubs.Average(h => h.Y) + Vehicle.SuspensionRest;
+        var anchors = new Vector3[4];
+        for (int i = 0; i < 4; i++)
+            anchors[i] = new Vector3(hubs[i].X, 0f, hubs[i].Z);
+
+        return new Vehicle(_physics, new Vector3(6.5f, centreHeight + 0.05f, 11f), 0.35f, anchors, centreHeight);
+    }
+
+    private static int WheelIndex(string nodeName) => nodeName switch
+    {
+        "KAMA_E224_LF" => 0,
+        "KAMA_E224_RF" => 1,
+        "KAMA_E224_LB" => 2,
+        "KAMA_E224_RB" => 3,
+        _ => -1,
+    };
 
     public void Run()
     {
@@ -79,14 +142,17 @@ public sealed class Game : IDisposable
 
         _player.Look(-_window.MouseDeltaX * MouseSensitivity, -_window.MouseDeltaY * MouseSensitivity);
 
-        if (_window.WasKeyPressed(VK_R))
+        if (_window.WasKeyPressed(VK_E))
+            ToggleVehicle();
+
+        if (!_driving && _window.WasKeyPressed(VK_R))
             _player.Teleport(_level.SpawnPoint);
 
         if (_window.WasKeyPressed(VK_L))
             _flashlightOn = !_flashlightOn;
 
         _fireCooldown -= dt;
-        bool wantsFire = _window.WasMousePressed() || _window.IsKeyDown(VK_F);
+        bool wantsFire = !_driving && (_window.WasMousePressed() || _window.IsKeyDown(VK_F));
         if (wantsFire && _fireCooldown <= 0)
         {
             _fireCooldown = 0.12f;
@@ -94,6 +160,35 @@ public sealed class Game : IDisposable
             _level.SpawnBall(_physics, _player.EyePosition + direction * 0.7f, direction * 26f + _player.Velocity * 0.4f);
             TrimDynamics();
         }
+    }
+
+    /// <summary>Gets in if the player is standing next to the car, gets out if already driving.</summary>
+    private void ToggleVehicle()
+    {
+        if (_driving)
+        {
+            // Step out on the driver's side, or the far side if that one is blocked.
+            var left = _car.ToWorld(new Vector3(1.75f, 0.1f, 0.2f));    // driver's side
+            var right = _car.ToWorld(new Vector3(-1.75f, 0.1f, 0.2f));
+            var exit = IsFree(left) ? left : IsFree(right) ? right : _car.Position + Vector3.UnitY * 2.2f;
+
+            _player.Enable(exit + new Vector3(0, Character.CylinderHalfLength + Character.Radius, 0));
+            _driving = false;
+            return;
+        }
+
+        if (Vector3.Distance(_player.Position, _car.Position) > EnterDistance) return;
+        _player.Disable();
+        _player.Yaw = _car.Yaw;   // start out looking where the car is pointing
+        _driving = true;
+    }
+
+    /// <summary>Rough check that a capsule would fit where the player is about to be put.</summary>
+    private bool IsFree(Vector3 position)
+    {
+        var centre = position + new Vector3(0, Character.CylinderHalfLength + Character.Radius, 0);
+        return !_physics.RayCastAny(centre, Vector3.UnitY, Character.CylinderHalfLength)
+            && !_physics.RayCastAny(centre, -Vector3.UnitY, Character.CylinderHalfLength + Character.Radius - 0.05f);
     }
 
     private void StepSimulation(float frameTime)
@@ -111,7 +206,13 @@ public sealed class Game : IDisposable
         {
             _accumulator -= FixedTimestep;
             SnapshotPoses();
-            _player.Move(wish, jump, FixedTimestep);
+            _car.SnapshotPose();
+
+            if (_driving)
+                _car.Update(wish.Y, wish.X, jump, FixedTimestep);
+            else
+                _player.Move(wish, jump, FixedTimestep);
+
             _physics.Step(FixedTimestep);
         }
     }
@@ -126,7 +227,10 @@ public sealed class Game : IDisposable
 
     private void Render(float alpha)
     {
-        var eye = _player.InterpolatedEyePosition(alpha);
+        var chassis = _car.InterpolatedChassisMatrix(alpha);
+        var eye = _driving
+            ? Vector3.Transform(SeatOffset, chassis)
+            : _player.InterpolatedEyePosition(alpha);
         var forward = _player.Forward;
         var view = Matrix4x4.CreateLookAt(eye, eye + forward, Vector3.UnitY);
         var projection = Matrix4x4.CreatePerspectiveFieldOfView(
@@ -165,14 +269,43 @@ public sealed class Game : IDisposable
             }
         }
 
+        AddCar(chassis);
         AddCrosshair(eye, forward);
 
-        // Held slightly below and right of the eye, the way a carried torch would be.
-        Spotlight? flashlight = _flashlightOn
-            ? Spotlight.Flashlight(eye + Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY)) * 0.18f - new Vector3(0, 0.12f, 0), forward)
-            : null;
+        // On foot it is a torch held below and right of the eye; behind the wheel the same
+        // key drives the car's headlights, mounted at the bumper and aimed where the car goes.
+        Spotlight? spotlight = null;
+        if (_flashlightOn)
+        {
+            spotlight = _driving
+                ? Spotlight.Headlights(Vector3.Transform(new Vector3(0f, -0.12f, 2.2f), chassis), _car.Forward)
+                : Spotlight.Flashlight(
+                    eye + Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY)) * 0.18f - new Vector3(0, 0.12f, 0),
+                    forward);
+        }
 
-        _renderer.RenderFrame(_scene, _overlay, _level.UpdateLights(_time), flashlight, view, projection, eye);
+        _renderer.RenderFrame(_scene, _overlay, _level.UpdateLights(_time), spotlight, view, projection, eye);
+    }
+
+    /// <summary>Queues the car: the shell rides the chassis, each wheel gets its own transform.</summary>
+    private void AddCar(in Matrix4x4 chassis)
+    {
+        // The model's origin is on the ground; the physics body's origin is its centre of mass.
+        var shell = Matrix4x4.CreateTranslation(0, -_car.CentreHeight, 0) * chassis;
+
+        foreach (var part in _carBodyParts)
+            _scene.Add(new DrawCommand(part.Mesh, part.Transform * shell, part.Color, Vector3.One, false, part.Texture));
+
+        for (int i = 0; i < _carWheelParts.Length; i++)
+        {
+            var hub = _car.WheelTransform(i, chassis);
+            foreach (var part in _carWheelParts[i])
+            {
+                var meshOrientation = part.Transform;
+                meshOrientation.Translation = Vector3.Zero;   // the hub position comes from the suspension
+                _scene.Add(new DrawCommand(part.Mesh, meshOrientation * hub, part.Color, Vector3.One, false, part.Texture));
+            }
+        }
     }
 
     /// <summary>Two small quads pinned in front of the camera — cheapest possible HUD.</summary>
@@ -215,15 +348,24 @@ public sealed class Game : IDisposable
         _fpsTimer += frameTime;
         if (_fpsTimer < 1f) return;
 
-        var speed = new Vector3(_player.Velocity.X, 0, _player.Velocity.Z).Length();
-        Console.WriteLine($"{_frameCount / _fpsTimer,6:F1} fps | speed {speed,5:F2} m/s | " +
-                          $"{(_player.OnGround ? "ground" : "air   ")} | bodies {_level.Dynamics.Count}");
+        if (_driving)
+        {
+            Console.WriteLine($"{_frameCount / _fpsTimer,6:F1} fps | driving {_car.ForwardSpeed * 3.6f,6:F1} km/h | " +
+                              $"bodies {_level.Dynamics.Count}");
+        }
+        else
+        {
+            var speed = new Vector3(_player.Velocity.X, 0, _player.Velocity.Z).Length();
+            Console.WriteLine($"{_frameCount / _fpsTimer,6:F1} fps | speed {speed,5:F2} m/s | " +
+                              $"{(_player.OnGround ? "ground" : "air   ")} | bodies {_level.Dynamics.Count}");
+        }
         _fpsTimer = 0;
         _frameCount = 0;
     }
 
     public void Dispose()
     {
+        _carModel.Dispose();
         _physics.Dispose();
         _renderer.Dispose();
     }
