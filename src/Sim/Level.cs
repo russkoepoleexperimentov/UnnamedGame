@@ -42,6 +42,7 @@ public sealed class Level
     public List<StaticProp> Statics { get; } = [];
     public List<DynamicProp> Dynamics { get; } = [];
     public Vector3 SpawnPoint { get; } = new(0, 2f, 14f);
+    public int LightCount => _lampSpecs.Length;
 
     public Level(PhysicsWorld physics)
     {

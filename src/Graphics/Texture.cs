@@ -20,6 +20,11 @@ public sealed class Texture : IDisposable
     public static Texture Load(ID3D11Device device, ID3D11DeviceContext context, string path)
     {
         using var bitmap = new Bitmap(path);
+        return FromBitmap(device, context, bitmap, generateMips: true);
+    }
+
+    public static Texture FromBitmap(ID3D11Device device, ID3D11DeviceContext context, Bitmap bitmap, bool generateMips)
+    {
         var rectangle = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
         var locked = bitmap.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
 
@@ -31,19 +36,19 @@ public sealed class Texture : IDisposable
             {
                 Width = (uint)bitmap.Width,
                 Height = (uint)bitmap.Height,
-                MipLevels = 0,
+                MipLevels = generateMips ? 0u : 1u,
                 ArraySize = 1,
                 Format = Format.B8G8R8A8_UNorm,
                 SampleDescription = new SampleDescription(1, 0),
                 Usage = ResourceUsage.Default,
-                BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget,
-                MiscFlags = ResourceOptionFlags.GenerateMips,
+                BindFlags = generateMips ? BindFlags.ShaderResource | BindFlags.RenderTarget : BindFlags.ShaderResource,
+                MiscFlags = generateMips ? ResourceOptionFlags.GenerateMips : ResourceOptionFlags.None,
             });
 
             context.UpdateSubresource(texture, 0, null, locked.Scan0, (uint)locked.Stride, 0);
 
             var view = device.CreateShaderResourceView(texture);
-            context.GenerateMips(view);
+            if (generateMips) context.GenerateMips(view);
             return new Texture(texture, view);
         }
         finally

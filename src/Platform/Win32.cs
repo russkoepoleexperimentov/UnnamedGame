@@ -5,7 +5,7 @@ namespace UnnamedGame.Platform;
 internal static class Win32
 {
     public const int WM_DESTROY = 0x0002, WM_SIZE = 0x0005, WM_CLOSE = 0x0010, WM_ACTIVATEAPP = 0x001C;
-    public const int WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105;
+    public const int WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_CHAR = 0x0102, WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105;
     public const int WM_INPUT = 0x00FF, WM_LBUTTONDOWN = 0x0201, WM_LBUTTONUP = 0x0202, WM_RBUTTONDOWN = 0x0204;
     public const int WM_SETFOCUS = 0x0007, WM_KILLFOCUS = 0x0008;
     public const int PM_REMOVE = 0x0001;

@@ -9,6 +9,7 @@ Console.WriteLine("""
       E         enter / leave the car
       L         flashlight on foot, headlights in the car
       R         respawn
+      ~         console (help lists commands, player_debug 1 for the overlay)
       Esc       release the mouse (click the window to capture it)
     """);
 

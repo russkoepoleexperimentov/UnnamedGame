@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using UnnamedGame.Platform;
+using UnnamedGame.UI;
 using Vortice.D3DCompiler;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -29,6 +30,13 @@ internal struct PerObjectData
 internal struct LightArray
 {
     private Vector4 _element;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct UiFrameData
+{
+    public Vector2 ScreenSize;
+    public Vector2 Pad;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -85,8 +93,11 @@ public sealed class Renderer : IDisposable
     private readonly ID3D11VertexShader _shadowVS;
     private readonly ID3D11VertexShader _lightingVS;
     private readonly ID3D11PixelShader _lightingPS;
-    private readonly ID3D11VertexShader _unlitVS;
-    private readonly ID3D11PixelShader _unlitPS;
+    private readonly ID3D11VertexShader _uiVS;
+    private readonly ID3D11PixelShader _uiPS;
+    private readonly ID3D11InputLayout _uiLayout;
+    private ID3D11Buffer _uiVertices;
+    private int _uiCapacity;
     private readonly ID3D11VertexShader _glassVS;
     private readonly ID3D11PixelShader _glassPS;
     private readonly ID3D11InputLayout _inputLayout;
@@ -95,6 +106,7 @@ public sealed class Renderer : IDisposable
     private readonly ID3D11Buffer _perObject;
     private readonly ID3D11Buffer _lighting;
     private readonly ID3D11Buffer _glassFrame;
+    private readonly ID3D11Buffer _uiFrame;
 
     private readonly ID3D11RasterizerState _rasterizer;
     private readonly ID3D11RasterizerState _shadowRasterizer;
@@ -106,6 +118,7 @@ public sealed class Renderer : IDisposable
     private readonly List<(float Distance, DrawCommand Command)> _sortedGlass = [];
     private readonly ID3D11SamplerState _shadowSampler;
     private readonly ID3D11SamplerState _albedoSampler;
+    private readonly ID3D11SamplerState _uiSampler;
 
     private readonly ID3D11Texture2D _sunShadowTexture;
     private readonly ID3D11DepthStencilView _sunShadowView;
@@ -166,8 +179,16 @@ public sealed class Renderer : IDisposable
         using (var blob = Compile(Shaders.Shadow, "VSMain", "vs_5_0")) _shadowVS = _device.CreateVertexShader(blob.AsSpan());
         using (var blob = Compile(Shaders.Lighting, "VSMain", "vs_5_0")) _lightingVS = _device.CreateVertexShader(blob.AsSpan());
         using (var blob = Compile(Shaders.Lighting, "PSMain", "ps_5_0")) _lightingPS = _device.CreatePixelShader(blob.AsSpan());
-        using (var blob = Compile(Shaders.Unlit, "VSMain", "vs_5_0")) _unlitVS = _device.CreateVertexShader(blob.AsSpan());
-        using (var blob = Compile(Shaders.Unlit, "PSMain", "ps_5_0")) _unlitPS = _device.CreatePixelShader(blob.AsSpan());
+        var uiVSBlob = Compile(Shaders.Ui, "VSMain", "vs_5_0");
+        _uiVS = _device.CreateVertexShader(uiVSBlob.AsSpan());
+        using (var blob = Compile(Shaders.Ui, "PSMain", "ps_5_0")) _uiPS = _device.CreatePixelShader(blob.AsSpan());
+        _uiLayout = _device.CreateInputLayout(
+        [
+            new InputElementDescription("POSITION", 0, Format.R32G32_Float, 0, 0),
+            new InputElementDescription("TEXCOORD", 0, Format.R32G32_Float, 8, 0),
+            new InputElementDescription("COLOR", 0, Format.R32G32B32A32_Float, 16, 0),
+        ], uiVSBlob.AsSpan());
+        uiVSBlob.Dispose();
         using (var blob = Compile(Shaders.Glass, "VSMain", "vs_5_0")) _glassVS = _device.CreateVertexShader(blob.AsSpan());
         using (var blob = Compile(Shaders.Glass, "PSMain", "ps_5_0")) _glassPS = _device.CreatePixelShader(blob.AsSpan());
 
@@ -184,6 +205,7 @@ public sealed class Renderer : IDisposable
         _perObject = CreateConstantBuffer<PerObjectData>();
         _lighting = CreateConstantBuffer<LightingData>();
         _glassFrame = CreateConstantBuffer<GlassFrameData>();
+        _uiFrame = CreateConstantBuffer<UiFrameData>();
 
         _rasterizer = _device.CreateRasterizerState(new RasterizerDescription
         {
@@ -233,6 +255,17 @@ public sealed class Renderer : IDisposable
             MaxLOD = float.MaxValue,
         });
 
+        _uiSampler = _device.CreateSamplerState(new SamplerDescription
+        {
+            Filter = Filter.MinMagMipPoint,   // crisp glyph edges, no bleeding between cells
+            AddressU = TextureAddressMode.Clamp,
+            AddressV = TextureAddressMode.Clamp,
+            AddressW = TextureAddressMode.Clamp,
+            MaxAnisotropy = 1,
+            MinLOD = 0,
+            MaxLOD = float.MaxValue,
+        });
+
         _albedoSampler = _device.CreateSamplerState(new SamplerDescription
         {
             Filter = Filter.Anisotropic,
@@ -250,6 +283,9 @@ public sealed class Renderer : IDisposable
         BoxMesh = Mesh.CreateBox(_device);
         SphereMesh = Mesh.CreateSphere(_device);
     }
+
+    /// <summary>Bakes the console/overlay font atlas.</summary>
+    public FontAtlas CreateFont() => new(_device, _context);
 
     /// <summary>Uploads a loaded model (meshes and textures) to the GPU.</summary>
     public RenderModel CreateModel(Assets.Model model) => RenderModel.Create(_device, _context, model);
@@ -347,7 +383,7 @@ public sealed class Renderer : IDisposable
     public void RenderFrame(
         IReadOnlyList<DrawCommand> scene,
         IReadOnlyList<DrawCommand> glass,
-        IReadOnlyList<DrawCommand> overlay,
+        UiBatch ui,
         IReadOnlyList<PointLight> pointLights,
         Spotlight? flashlight,
         in Matrix4x4 view,
@@ -368,7 +404,7 @@ public sealed class Renderer : IDisposable
         GeometryPass(viewProjection, scene);
         LightingPass(viewProjection, sunViewProjection, spotViewProjection, pointLights, flashlight, cameraPosition);
         GlassPass(viewProjection, glass, cameraPosition);
-        OverlayPass(viewProjection, overlay);
+        UiPass(ui);
 
         _swapChain.Present(1, PresentFlags.None);
     }
@@ -519,23 +555,54 @@ public sealed class Renderer : IDisposable
         _context.OMSetBlendState(null);
     }
 
-    private void OverlayPass(in Matrix4x4 viewProjection, IReadOnlyList<DrawCommand> overlay)
+    /// <summary>Draws the batched 2D geometry (console, overlay, crosshair) over the frame.</summary>
+    private void UiPass(UiBatch ui)
     {
-        if (overlay.Count == 0) return;
+        if (ui is null || ui.VertexCount == 0) return;
+
+        EnsureUiCapacity(ui.VertexCount);
+        WriteVertices(ui);
+
+        Write(_uiFrame, new UiFrameData { ScreenSize = new Vector2(_window.Width, _window.Height) });
 
         _context.PSSetShaderResources(0, [null, null, null, null, null]);
         _context.OMSetRenderTargets(_backBufferView, null);
+        _context.RSSetViewport(0, 0, _window.Width, _window.Height);
+        _context.RSSetState(_noCullRasterizer);
         _context.OMSetDepthStencilState(_noDepthState);
-        _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-        _context.IASetInputLayout(_inputLayout);
-        _context.VSSetShader(_unlitVS);
-        _context.PSSetShader(_unlitPS);
-        _context.VSSetConstantBuffer(0, _perPass);
-        _context.VSSetConstantBuffer(1, _perObject);
-        _context.PSSetConstantBuffer(1, _perObject);
+        _context.OMSetBlendState(_alphaBlend);
 
-        Write(_perPass, new PerPassData { ViewProjection = viewProjection });
-        DrawAll(overlay);
+        _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+        _context.IASetInputLayout(_uiLayout);
+        _context.IASetVertexBuffer(0, _uiVertices, (uint)Unsafe.SizeOf<UiVertex>());
+        _context.VSSetShader(_uiVS);
+        _context.PSSetShader(_uiPS);
+        _context.VSSetConstantBuffer(0, _uiFrame);
+        _context.PSSetShaderResource(0, ui.Font.Texture.View);
+        _context.PSSetSampler(0, _uiSampler);
+        _context.Draw((uint)ui.VertexCount, 0);
+
+        _context.OMSetBlendState(null);
+    }
+
+    private void EnsureUiCapacity(int vertexCount)
+    {
+        if (_uiVertices is not null && _uiCapacity >= vertexCount) return;
+
+        _uiVertices?.Dispose();
+        _uiCapacity = Math.Max(4096, (int)BitOperations.RoundUpToPowerOf2((uint)vertexCount));
+        _uiVertices = _device.CreateBuffer(new BufferDescription(
+            (uint)(_uiCapacity * Unsafe.SizeOf<UiVertex>()),
+            BindFlags.VertexBuffer, ResourceUsage.Dynamic, CpuAccessFlags.Write));
+    }
+
+    private unsafe void WriteVertices(UiBatch ui)
+    {
+        var mapped = _context.Map(_uiVertices, 0u, MapMode.WriteDiscard, Vortice.Direct3D11.MapFlags.None);
+        var destination = new Span<UiVertex>((void*)mapped.DataPointer, _uiCapacity);
+        for (int i = 0; i < ui.VertexCount; i++)
+            destination[i] = ui.Vertices[i];
+        _context.Unmap(_uiVertices, 0u);
     }
 
     private void DrawAll(IReadOnlyList<DrawCommand> commands, bool bindTextures = false)
@@ -614,6 +681,8 @@ public sealed class Renderer : IDisposable
         _alphaBlend.Dispose();
         _noCullRasterizer.Dispose();
         _readOnlyDepthState.Dispose();
+        _uiVertices?.Dispose();
+        _uiSampler.Dispose();
         _albedoSampler.Dispose();
         _shadowSampler.Dispose();
         _noDepthState.Dispose();
@@ -621,6 +690,7 @@ public sealed class Renderer : IDisposable
         _shadowRasterizer.Dispose();
         _rasterizer.Dispose();
 
+        _uiFrame.Dispose();
         _glassFrame.Dispose();
         _lighting.Dispose();
         _perObject.Dispose();
@@ -629,8 +699,9 @@ public sealed class Renderer : IDisposable
         _inputLayout.Dispose();
         _glassPS.Dispose();
         _glassVS.Dispose();
-        _unlitPS.Dispose();
-        _unlitVS.Dispose();
+        _uiLayout.Dispose();
+        _uiPS.Dispose();
+        _uiVS.Dispose();
         _lightingPS.Dispose();
         _lightingVS.Dispose();
         _shadowVS.Dispose();

@@ -9,6 +9,7 @@ public sealed class GameWindow
     private readonly WndProc _proc;   // kept alive: the OS holds a raw pointer to it
     private readonly bool[] _down = new bool[256];
     private readonly bool[] _pressed = new bool[256];
+    private readonly List<char> _typed = [];
 
     public IntPtr Handle { get; private set; }
     public int Width { get; private set; }
@@ -56,6 +57,9 @@ public sealed class GameWindow
         RegisterRawInputDevices(rid, 1, Marshal.SizeOf<RAWINPUTDEVICE>());
     }
 
+    /// <summary>Characters typed this frame, from WM_CHAR: already layout- and repeat-aware.</summary>
+    public IReadOnlyList<char> TypedCharacters => _typed;
+
     public bool IsKeyDown(int vk) => _down[vk & 0xFF];
     public bool WasKeyPressed(int vk) => _pressed[vk & 0xFF];
     public bool WasMousePressed() => _lmbPressed;
@@ -63,6 +67,7 @@ public sealed class GameWindow
     public void PumpEvents()
     {
         Array.Clear(_pressed);
+        _typed.Clear();
         _lmbPressed = false;
         Resized = false;
         _accumX = _accumY = 0;
@@ -76,6 +81,13 @@ public sealed class GameWindow
         MouseDeltaX = _accumX;
         MouseDeltaY = _accumY;
         if (MouseCaptured) ConfineCursor();
+    }
+
+    /// <summary>Asks the game loop to shut down (the console "quit" command).</summary>
+    public void Close()
+    {
+        IsClosed = true;
+        SetMouseCapture(false);
     }
 
     public void SetMouseCapture(bool captured)
@@ -132,6 +144,10 @@ public sealed class GameWindow
                 _down[vk] = true;
                 return IntPtr.Zero;
             }
+
+            case WM_CHAR:
+                _typed.Add((char)(int)wParam);
+                return IntPtr.Zero;
 
             case WM_KEYUP:
             case WM_SYSKEYUP:

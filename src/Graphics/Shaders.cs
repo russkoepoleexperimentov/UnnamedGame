@@ -310,17 +310,49 @@ internal static class Shaders
     }
     """;
 
-    /// <summary>Overlay drawn after lighting (the crosshair), unaffected by any light.</summary>
-    public static readonly string Unlit = Common + """
-
-    float4 VSMain(VSIn input) : SV_POSITION
+    /// <summary>
+    /// 2D pass for the console, the debug overlay and the crosshair. Positions arrive in pixels
+    /// and are mapped to clip space here, so the batch never has to know the resolution.
+    /// </summary>
+    public const string Ui = """
+    cbuffer UiFrame : register(b0)
     {
-        return mul(mul(float4(input.Position, 1.0), World), ViewProjection);
+        float2 ScreenSize;
+        float2 _uipad;
+    };
+
+    Texture2D<float4> Atlas : register(t0);
+    SamplerState AtlasSampler : register(s0);
+
+    struct VSIn
+    {
+        float2 Position : POSITION;
+        float2 Uv       : TEXCOORD0;
+        float4 Color    : COLOR0;
+    };
+
+    struct VSOut
+    {
+        float4 Position : SV_POSITION;
+        float2 Uv       : TEXCOORD0;
+        float4 Color    : COLOR0;
+    };
+
+    VSOut VSMain(VSIn input)
+    {
+        VSOut o;
+        float2 ndc = input.Position / ScreenSize * float2(2.0, -2.0) + float2(-1.0, 1.0);
+        o.Position = float4(ndc, 0.0, 1.0);
+        o.Uv = input.Uv;
+        o.Color = input.Color;
+        return o;
     }
 
-    float4 PSMain() : SV_TARGET
+    float4 PSMain(VSOut input) : SV_TARGET
     {
-        return float4(pow(saturate(Color.rgb), 1.0 / 2.2), 1.0);
+        // The atlas is white glyphs on transparent black, so coverage lives in the alpha.
+        float4 texel = Atlas.Sample(AtlasSampler, input.Uv);
+        return float4(input.Color.rgb, input.Color.a * texel.a);
     }
     """;
 }
