@@ -6,6 +6,7 @@ Console.WriteLine("""
       Space     jump (hold to bunny-hop)
       Mouse     look
       LMB / F   fire a physics ball
+      L         toggle the flashlight
       R         respawn
       Esc       release the mouse (click the window to capture it)
     """);

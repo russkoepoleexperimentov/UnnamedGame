@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using UnnamedGame.Graphics;
 using UnnamedGame.Platform;
 using UnnamedGame.Sim;
@@ -12,7 +13,7 @@ public sealed class Game : IDisposable
     private const float MouseSensitivity = 0.0022f;
     private const int MaxDynamics = 400;
 
-    private const int VK_ESCAPE = 0x1B, VK_SPACE = 0x20, VK_SHIFT = 0x10, VK_R = 0x52, VK_F = 0x46;
+    private const int VK_ESCAPE = 0x1B, VK_SPACE = 0x20, VK_SHIFT = 0x10, VK_R = 0x52, VK_F = 0x46, VK_L = 0x4C;
     private const int VK_W = 0x57, VK_A = 0x41, VK_S = 0x53, VK_D = 0x44;
 
     private readonly GameWindow _window;
@@ -20,6 +21,11 @@ public sealed class Game : IDisposable
     private readonly PhysicsWorld _physics;
     private readonly Level _level;
     private readonly Character _player;
+
+    private readonly List<DrawCommand> _scene = [];
+    private readonly List<DrawCommand> _overlay = [];
+    private bool _flashlightOn = true;
+    private float _time;
 
     private float _accumulator;
     private float _fireCooldown;
@@ -50,9 +56,12 @@ public sealed class Game : IDisposable
             if (_window.IsClosed) break;
             if (_window.Resized) _renderer.Resize();
 
+            _time += frameTime;
             HandleInput(frameTime);
             StepSimulation(frameTime);
-            Render();
+            // Whatever time is left over in the accumulator is how far past the last
+            // simulated state we are; render that fraction of the way to the current one.
+            Render(Math.Clamp(_accumulator / FixedTimestep, 0f, 1f));
             ReportFps(frameTime);
         }
     }
@@ -72,6 +81,9 @@ public sealed class Game : IDisposable
 
         if (_window.WasKeyPressed(VK_R))
             _player.Teleport(_level.SpawnPoint);
+
+        if (_window.WasKeyPressed(VK_L))
+            _flashlightOn = !_flashlightOn;
 
         _fireCooldown -= dt;
         bool wantsFire = _window.WasMousePressed() || _window.IsKeyDown(VK_F);
@@ -98,57 +110,74 @@ public sealed class Game : IDisposable
         while (_accumulator >= FixedTimestep && steps++ < 8)
         {
             _accumulator -= FixedTimestep;
+            SnapshotPoses();
             _player.Move(wish, jump, FixedTimestep);
             _physics.Step(FixedTimestep);
         }
     }
 
-    private void Render()
+    /// <summary>Records where every body was before the step, so rendering can interpolate.</summary>
+    private void SnapshotPoses()
     {
-        var eye = _player.EyePosition;
-        var view = Matrix4x4.CreateLookAt(eye, eye + _player.Forward, Vector3.UnitY);
+        var props = CollectionsMarshal.AsSpan(_level.Dynamics);
+        for (int i = 0; i < props.Length; i++)
+            props[i].PreviousPose = _physics.Simulation.Bodies[props[i].Handle].Pose;
+    }
+
+    private void Render(float alpha)
+    {
+        var eye = _player.InterpolatedEyePosition(alpha);
+        var forward = _player.Forward;
+        var view = Matrix4x4.CreateLookAt(eye, eye + forward, Vector3.UnitY);
         var projection = Matrix4x4.CreatePerspectiveFieldOfView(
             75f * MathF.PI / 180f, _renderer.AspectRatio, 0.05f, 300f);
 
-        _renderer.BeginFrame(view * projection, eye);
+        _scene.Clear();
+        _overlay.Clear();
 
         foreach (var prop in _level.Statics)
         {
             var world = Matrix4x4.CreateScale(prop.Size)
                 * Matrix4x4.CreateFromQuaternion(prop.Orientation)
                 * Matrix4x4.CreateTranslation(prop.Center);
-            _renderer.Draw(_renderer.BoxMesh, world, prop.Color, new Vector3(2f), prop.Checker);
+            _scene.Add(new DrawCommand(_renderer.BoxMesh, world, prop.Color, new Vector3(2f), prop.Checker));
         }
 
         foreach (var prop in _level.Dynamics)
         {
-            var body = _physics.Simulation.Bodies[prop.Handle];
-            var pose = body.Pose;
+            var current = _physics.Simulation.Bodies[prop.Handle].Pose;
+            var position = Vector3.Lerp(prop.PreviousPose.Position, current.Position, alpha);
+            var orientation = Quaternion.Slerp(prop.PreviousPose.Orientation, current.Orientation, alpha);
+
             if (prop.IsSphere)
             {
                 var world = Matrix4x4.CreateScale(prop.Radius)
-                    * Matrix4x4.CreateFromQuaternion(pose.Orientation)
-                    * Matrix4x4.CreateTranslation(pose.Position);
-                _renderer.Draw(_renderer.SphereMesh, world, prop.Color, Vector3.One, checker: false);
+                    * Matrix4x4.CreateFromQuaternion(orientation)
+                    * Matrix4x4.CreateTranslation(position);
+                _scene.Add(new DrawCommand(_renderer.SphereMesh, world, prop.Color, Vector3.One, Checker: false));
             }
             else
             {
                 var world = Matrix4x4.CreateScale(prop.Size)
-                    * Matrix4x4.CreateFromQuaternion(pose.Orientation)
-                    * Matrix4x4.CreateTranslation(pose.Position);
-                _renderer.Draw(_renderer.BoxMesh, world, prop.Color, prop.Size * 0.5f, checker: true);
+                    * Matrix4x4.CreateFromQuaternion(orientation)
+                    * Matrix4x4.CreateTranslation(position);
+                _scene.Add(new DrawCommand(_renderer.BoxMesh, world, prop.Color, prop.Size * 0.5f, Checker: true));
             }
         }
 
-        DrawCrosshair();
-        _renderer.EndFrame();
+        AddCrosshair(eye, forward);
+
+        // Held slightly below and right of the eye, the way a carried torch would be.
+        Spotlight? flashlight = _flashlightOn
+            ? Spotlight.Flashlight(eye + Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY)) * 0.18f - new Vector3(0, 0.12f, 0), forward)
+            : null;
+
+        _renderer.RenderFrame(_scene, _overlay, _level.UpdateLights(_time), flashlight, view, projection, eye);
     }
 
     /// <summary>Two small quads pinned in front of the camera — cheapest possible HUD.</summary>
-    private void DrawCrosshair()
+    private void AddCrosshair(Vector3 eye, Vector3 forward)
     {
-        var eye = _player.EyePosition;
-        var forward = _player.Forward;
         var right = Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY));
         var up = Vector3.Cross(right, forward);
 
@@ -160,12 +189,12 @@ public sealed class Game : IDisposable
         var center = eye + forward * 0.12f;
         var color = new Vector4(0.95f, 0.95f, 0.95f, 1f);
 
-        _renderer.Draw(_renderer.BoxMesh,
+        _overlay.Add(new DrawCommand(_renderer.BoxMesh,
             Matrix4x4.CreateScale(0.0035f, 0.0004f, 0.0004f) * basis * Matrix4x4.CreateTranslation(center),
-            color, Vector3.One, checker: false);
-        _renderer.Draw(_renderer.BoxMesh,
+            color, Vector3.One, Checker: false));
+        _overlay.Add(new DrawCommand(_renderer.BoxMesh,
             Matrix4x4.CreateScale(0.0004f, 0.0035f, 0.0004f) * basis * Matrix4x4.CreateTranslation(center),
-            color, Vector3.One, checker: false);
+            color, Vector3.One, Checker: false));
     }
 
     /// <summary>Keeps the body count bounded by retiring the oldest spawned balls.</summary>
