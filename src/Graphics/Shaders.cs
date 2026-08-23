@@ -4,6 +4,16 @@ internal static class Shaders
 {
     public const int MaxPointLights = 16;
 
+    /// <summary>Reinhard tone mapping; without it a light close to a wall clips straight to white.</summary>
+    private const string ToneMapping = """
+    float3 ToneMap(float3 color)
+    {
+        const float exposure = 1.6;
+        color *= exposure;
+        return pow(saturate(color / (1.0 + color)), 1.0 / 2.2);
+    }
+    """;
+
     /// <summary>Shared declarations: both passes use the same per-object data and matrices.</summary>
     private const string Common = """
     cbuffer PerPass : register(b0)
@@ -96,7 +106,8 @@ internal static class Shaders
     /// accumulates the sun (shadow mapped), the player's flashlight (shadow mapped) and up to
     /// 16 unshadowed point lights.
     /// </summary>
-    public static readonly string Lighting = """
+    public static readonly string Lighting = ToneMapping + """
+
     #define MAX_POINT_LIGHTS 16
 
     cbuffer LightingData : register(b0)
@@ -158,14 +169,6 @@ internal static class Shaders
                 sum += map.SampleCmpLevelZero(ShadowSampler, uv + float2(x, y) * texelSize, clip.z - 0.0015);
         }
         return sum / 9.0;
-    }
-
-    // Reinhard: without it a light close to a wall clips straight to white.
-    float3 ToneMap(float3 color)
-    {
-        const float exposure = 1.6;
-        color *= exposure;
-        return pow(saturate(color / (1.0 + color)), 1.0 / 2.2);
     }
 
     float3 Shade(float3 albedo, float3 n, float3 v, float3 lightDirection, float3 radiance)
@@ -242,6 +245,68 @@ internal static class Shaders
         float fog = saturate((length(CameraPosition - worldPos) - 25.0) / 65.0);
         float3 final = lerp(lit, skyColor, fog);
         return float4(ToneMap(final), 1.0);
+    }
+    """;
+
+    /// <summary>
+    /// Forward pass for glass, drawn after lighting and blended over it. Deferred shading has
+    /// nowhere to put a translucent surface, so the windows are shaded here directly: a Fresnel
+    /// term (glass turns mirror-like at grazing angles), a sky reflection and a sun highlight.
+    /// </summary>
+    public static readonly string Glass = Common + ToneMapping + """
+
+    cbuffer GlassFrame : register(b2)
+    {
+        float3 CameraPosition; float _gpad0;
+        float3 SunDirection;   float SunIntensity;
+        float3 SunColor;       float _gpad1;
+        float3 SkyColor;       float _gpad2;
+    };
+
+    Texture2D<float4> AlphaTexture : register(t0);
+    SamplerState AlphaSampler : register(s0);
+
+    struct VSOut
+    {
+        float4 Position : SV_POSITION;
+        float3 WorldPos : TEXCOORD0;
+        float3 Normal   : TEXCOORD1;
+        float2 Uv       : TEXCOORD2;
+    };
+
+    VSOut VSMain(VSIn input)
+    {
+        VSOut o;
+        float4 world = mul(float4(input.Position, 1.0), World);
+        o.WorldPos = world.xyz;
+        o.Position = mul(world, ViewProjection);
+        o.Normal   = normalize(mul(float4(input.Normal, 0.0), World).xyz);
+        o.Uv       = input.Uv;
+        return o;
+    }
+
+    float4 PSMain(VSOut input) : SV_TARGET
+    {
+        float3 v = normalize(CameraPosition - input.WorldPos);
+        float3 n = normalize(input.Normal);
+        if (dot(n, v) < 0.0) n = -n;   // the pass is two-sided: windows are seen from inside too
+
+        float alpha = Color.a;
+        if (Checker > 1.5)
+            alpha *= AlphaTexture.Sample(AlphaSampler, input.Uv).a;
+
+        // Schlick: nearly clear head-on, close to a mirror at a glancing angle.
+        float fresnel = pow(1.0 - saturate(dot(n, v)), 5.0);
+        alpha = saturate(alpha + fresnel * (1.0 - alpha) * 0.85);
+
+        float3 halfway = normalize(-SunDirection + v);
+        float specular = pow(saturate(dot(n, halfway)), 220.0) * 2.2;
+
+        float3 color = Color.rgb * 0.05
+                     + SkyColor * lerp(0.35, 1.6, fresnel)
+                     + SunColor * (SunIntensity * specular);
+
+        return float4(ToneMap(color), alpha);
     }
     """;
 

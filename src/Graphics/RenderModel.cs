@@ -7,7 +7,9 @@ namespace UnnamedGame.Graphics;
 /// <summary>GPU-side copy of a loaded model: one mesh per material, textures shared by path.</summary>
 public sealed class RenderModel : IDisposable
 {
-    public sealed record Part(string NodeName, Mesh Mesh, Matrix4x4 Transform, Vector4 Color, Texture Texture);
+    /// <param name="Color">RGB is the material colour; A is its opacity (1 for solid parts).</param>
+    /// <param name="IsGlass">Drawn by the forward transparency pass instead of the G-buffer.</param>
+    public sealed record Part(string NodeName, Mesh Mesh, Matrix4x4 Transform, Vector4 Color, Texture Texture, bool IsGlass);
 
     private readonly List<Mesh> _meshes = [];
     private readonly Dictionary<string, Texture> _textures = [];
@@ -24,27 +26,24 @@ public sealed class RenderModel : IDisposable
                 ? model.Materials[part.MaterialIndex]
                 : null;
 
-            // Deferred shading has no blending, so glass would render as an opaque wall in
-            // front of the interior — and the driver's view. Left out until there is a
-            // forward transparency pass.
-            if (material is { IsTransparent: true }) continue;
             if (part.Vertices.Length == 0 || part.Indices.Length == 0) continue;
+            bool glass = material is { IsTransparent: true };
 
             var mesh = new Mesh(device, part.Vertices, part.Indices);
             result._meshes.Add(mesh);
 
+            // Glass takes its transparency map; everything else takes its albedo map.
+            string path = glass ? material.AlphaTexturePath : material?.TexturePath;
             Texture texture = null;
-            if (material?.TexturePath is { } path)
+            if (path is not null && !result._textures.TryGetValue(path, out texture))
             {
-                if (!result._textures.TryGetValue(path, out texture))
-                {
-                    texture = Texture.Load(device, context, path);
-                    result._textures[path] = texture;
-                }
+                texture = Texture.Load(device, context, path);
+                result._textures[path] = texture;
             }
 
             var colour = material is null ? Vector3.One : material.Diffuse;
-            result.Parts.Add(new Part(part.NodeName, mesh, part.Transform, new Vector4(colour, 1f), texture));
+            float opacity = material?.Opacity ?? 1f;
+            result.Parts.Add(new Part(part.NodeName, mesh, part.Transform, new Vector4(colour, opacity), texture, glass));
         }
 
         return result;

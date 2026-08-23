@@ -8,7 +8,9 @@ public sealed class ModelMaterial
     public string Name = "";
     public Vector3 Diffuse = new(0.8f);
     public string TexturePath;      // resolved absolute path, or null for a flat colour
-    public bool IsTransparent;      // glass: skipped by the deferred geometry pass
+    public string AlphaTexturePath; // transparency map, if the material has one
+    public float Opacity = 1f;      // FBX "Opacity"; 1 unless the material declares otherwise
+    public bool IsTransparent;      // glass: drawn in the forward pass, not the G-buffer
 }
 
 /// <summary>One mesh with one material, in node-local space plus that node's transform.</summary>
@@ -142,6 +144,13 @@ public static class ModelLoader
         if (diffuse is { Length: >= 3 })
             material.Diffuse = new Vector3((float)diffuse[0], (float)diffuse[1], (float)diffuse[2]);
 
+        var opacity = node.FindProperty70("Opacity");
+        if (opacity is { Length: >= 1 })
+        {
+            material.Opacity = (float)opacity[0];
+            if (material.Opacity < 0.99f) material.IsTransparent = true;
+        }
+
         if (childrenOf.TryGetValue(id, out var links))
         {
             foreach (var (child, property) in links)
@@ -159,7 +168,10 @@ public static class ModelLoader
                 if (property is "DiffuseColor" or "Maya|baseColor")
                     material.TexturePath = resolved;
                 else if (property is "TransparencyFactor" or "TransparentColor")
+                {
+                    material.AlphaTexturePath = resolved;
                     material.IsTransparent = true;
+                }
             }
         }
 

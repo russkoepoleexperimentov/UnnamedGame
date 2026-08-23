@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using UnnamedGame.Assets;
+using UnnamedGame.Audio;
 using UnnamedGame.Graphics;
 using UnnamedGame.Platform;
 using UnnamedGame.Sim;
@@ -26,17 +27,22 @@ public sealed class Game : IDisposable
     private readonly PhysicsWorld _physics;
     private readonly Level _level;
     private readonly Character _player;
+    private readonly AudioEngine _audio;
+    private readonly GameAudio _sounds;
     private readonly RenderModel _carModel;
     private readonly Vehicle _car;
     private readonly List<RenderModel.Part> _carBodyParts = [];
     private readonly List<RenderModel.Part>[] _carWheelParts = [[], [], [], []];
+    private readonly List<RenderModel.Part> _carGlassParts = [];
     private bool _driving;
 
     private readonly List<DrawCommand> _scene = [];
+    private readonly List<DrawCommand> _glass = [];
     private readonly List<DrawCommand> _overlay = [];
     private bool _flashlightOn = true;
     private float _time;
 
+    private float _driveThrottle;
     private float _accumulator;
     private float _fireCooldown;
     private float _fpsTimer;
@@ -50,14 +56,19 @@ public sealed class Game : IDisposable
         _level = new Level(_physics);
         _player = new Character(_physics, _level.SpawnPoint);
 
+        _audio = new AudioEngine();
+        _sounds = new GameAudio(_audio);
+
         var loadClock = Stopwatch.StartNew();
         var model = ModelLoader.Load(
             AssetPaths.Get("models", "vehicles", "lada vaz 2110.fbx"),
             AssetPaths.Get("textures", "vehicles"));
         _carModel = _renderer.CreateModel(model);
         _car = BuildVehicle();
-        Console.WriteLine($"loaded car: {model.Parts.Count} parts, {_carModel.Parts.Count} drawn, " +
+        Console.WriteLine($"loaded car: {model.Parts.Count} parts ({_carGlassParts.Count} glass), " +
                           $"{model.Materials.Count} materials in {loadClock.ElapsedMilliseconds} ms");
+        Console.WriteLine($"audio: {(_audio.IsAvailable ? "XAudio2" : "disabled")}, " +
+                          $"{_sounds.LoadedFootstepClips} footstep clips");
     }
 
     /// <summary>
@@ -72,6 +83,11 @@ public sealed class Game : IDisposable
         foreach (var part in _carModel.Parts)
         {
             int wheel = WheelIndex(part.NodeName);
+            if (part.IsGlass && wheel < 0)
+            {
+                _carGlassParts.Add(part);   // windows and light covers ride the body
+                continue;
+            }
             if (wheel < 0)
             {
                 _carBodyParts.Add(part);
@@ -122,6 +138,7 @@ public sealed class Game : IDisposable
             _time += frameTime;
             HandleInput(frameTime);
             StepSimulation(frameTime);
+            UpdateAudio(frameTime);
             // Whatever time is left over in the accumulator is how far past the last
             // simulated state we are; render that fraction of the way to the current one.
             Render(Math.Clamp(_accumulator / FixedTimestep, 0f, 1f));
@@ -198,6 +215,7 @@ public sealed class Game : IDisposable
             (_window.IsKeyDown(VK_W) ? 1 : 0) - (_window.IsKeyDown(VK_S) ? 1 : 0));
         bool jump = _window.IsKeyDown(VK_SPACE);
         if (!_window.MouseCaptured) { wish = Vector2.Zero; jump = false; }
+        _driveThrottle = wish.Y;
 
         // Fixed timestep keeps the movement curves and the solver deterministic.
         _accumulator += frameTime;
@@ -225,6 +243,24 @@ public sealed class Game : IDisposable
             props[i].PreviousPose = _physics.Simulation.Bodies[props[i].Handle].Pose;
     }
 
+    /// <summary>Places the listener, then lets the sound logic follow the simulation state.</summary>
+    private void UpdateAudio(float frameTime)
+    {
+        var forward = _player.Forward;
+        var right = Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY));
+        var listener = _driving ? Vector3.Transform(SeatOffset, _car.ChassisMatrix()) : _player.EyePosition;
+        _audio.SetListener(listener, right);
+
+        if (_driving)
+            _sounds.SuspendFootsteps();
+        else
+            _sounds.UpdateFootsteps(_player.Velocity, _player.OnGround,
+                _level.SurfaceOf(_player.GroundCollidable), frameTime);
+
+        _sounds.UpdateVehicle(_car, _driving, _driveThrottle, frameTime);
+        _audio.Update(frameTime);
+    }
+
     private void Render(float alpha)
     {
         var chassis = _car.InterpolatedChassisMatrix(alpha);
@@ -237,6 +273,7 @@ public sealed class Game : IDisposable
             75f * MathF.PI / 180f, _renderer.AspectRatio, 0.05f, 300f);
 
         _scene.Clear();
+        _glass.Clear();
         _overlay.Clear();
 
         foreach (var prop in _level.Statics)
@@ -284,7 +321,7 @@ public sealed class Game : IDisposable
                     forward);
         }
 
-        _renderer.RenderFrame(_scene, _overlay, _level.UpdateLights(_time), spotlight, view, projection, eye);
+        _renderer.RenderFrame(_scene, _glass, _overlay, _level.UpdateLights(_time), spotlight, view, projection, eye);
     }
 
     /// <summary>Queues the car: the shell rides the chassis, each wheel gets its own transform.</summary>
@@ -295,6 +332,9 @@ public sealed class Game : IDisposable
 
         foreach (var part in _carBodyParts)
             _scene.Add(new DrawCommand(part.Mesh, part.Transform * shell, part.Color, Vector3.One, false, part.Texture));
+
+        foreach (var part in _carGlassParts)
+            _glass.Add(new DrawCommand(part.Mesh, part.Transform * shell, part.Color, Vector3.One, false, part.Texture));
 
         for (int i = 0; i < _carWheelParts.Length; i++)
         {
@@ -365,6 +405,8 @@ public sealed class Game : IDisposable
 
     public void Dispose()
     {
+        _sounds.Dispose();
+        _audio.Dispose();
         _carModel.Dispose();
         _physics.Dispose();
         _renderer.Dispose();

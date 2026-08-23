@@ -1,10 +1,14 @@
 using System.Numerics;
 using BepuPhysics;
+using BepuPhysics.Collidables;
 using UnnamedGame.Graphics;
 
 namespace UnnamedGame.Sim;
 
 public readonly record struct StaticProp(Vector3 Center, Vector3 Size, Quaternion Orientation, Vector4 Color, bool Checker);
+
+/// <summary>Picks which footstep bank plays when the player walks on a surface.</summary>
+public enum Surface { Concrete, Metal, Gravel, Earth, Grass }
 
 public record struct DynamicProp(BodyHandle Handle, Vector3 Size, float Radius, Vector4 Color)
 {
@@ -33,6 +37,7 @@ public sealed class Level
     ];
 
     private readonly List<PointLight> _lights = [];
+    private readonly Dictionary<int, Surface> _surfaces = [];
 
     public List<StaticProp> Statics { get; } = [];
     public List<DynamicProp> Dynamics { get; } = [];
@@ -50,31 +55,33 @@ public sealed class Level
         // A raised platform in the back corner, reachable by a ramp. The ramp is placed so its
         // top surface meets the platform edge exactly (x = -4, y = 3) and reaches the floor at
         // x = 3.5 — a mismatch here reads as the player falling off a ledge, not walking down.
-        AddStatic(physics, new Vector3(-11, 1.5f, -12), new Vector3(14, 3, 12), PillarColor, checker: true);
+        AddStatic(physics, new Vector3(-11, 1.5f, -12), new Vector3(14, 3, 12), PillarColor, checker: true, Surface.Gravel);
         AddStatic(physics, new Vector3(-0.36f, 1.22f, -12),
-            new Vector3(8.2f, 0.6f, 12), Quaternion.CreateFromAxisAngle(Vector3.UnitZ, -0.38f), RampColor, checker: true);
+            new Vector3(8.2f, 0.6f, 12), Quaternion.CreateFromAxisAngle(Vector3.UnitZ, -0.38f), RampColor, checker: true,
+            Surface.Metal);
 
         // Catwalk along the east wall, plus the pillars holding it up.
-        AddStatic(physics, new Vector3(15, 4, 0), new Vector3(8, 0.5f, 26), PillarColor, checker: true);
-        AddStatic(physics, new Vector3(11.5f, 2, -10), new Vector3(1, 4, 1), PillarColor, checker: false);
-        AddStatic(physics, new Vector3(11.5f, 2, 0), new Vector3(1, 4, 1), PillarColor, checker: false);
-        AddStatic(physics, new Vector3(11.5f, 2, 10), new Vector3(1, 4, 1), PillarColor, checker: false);
+        AddStatic(physics, new Vector3(15, 4, 0), new Vector3(8, 0.5f, 26), PillarColor, checker: true, Surface.Metal);
+        AddStatic(physics, new Vector3(11.5f, 2, -10), new Vector3(1, 4, 1), PillarColor, checker: false, Surface.Metal);
+        AddStatic(physics, new Vector3(11.5f, 2, 0), new Vector3(1, 4, 1), PillarColor, checker: false, Surface.Metal);
+        AddStatic(physics, new Vector3(11.5f, 2, 10), new Vector3(1, 4, 1), PillarColor, checker: false, Surface.Metal);
         // Ramp up to the catwalk: floor at z = 19.5 to the catwalk deck at z = 13, y = 4.25.
         AddStatic(physics, new Vector3(13.5f, 1.87f, 16.09f),
-            new Vector3(5, 0.6f, 7.77f), Quaternion.CreateFromAxisAngle(Vector3.UnitX, 0.5796f), RampColor, checker: true);
+            new Vector3(5, 0.6f, 7.77f), Quaternion.CreateFromAxisAngle(Vector3.UnitX, 0.5796f), RampColor, checker: true,
+            Surface.Metal);
 
         // Two flights of stairs — the reason the character does step-up probing.
         for (int i = 0; i < 6; i++)
         {
             float height = 0.5f * (i + 1);
             AddStatic(physics, new Vector3(-16f, height * 0.5f, -3.5f - i * 0.6f),
-                new Vector3(6, height, 0.6f), PillarColor, checker: false);
+                new Vector3(6, height, 0.6f), PillarColor, checker: false, Surface.Metal);
         }
         for (int i = 0; i < 4; i++)
         {
             float height = 0.5f * (i + 1);
             AddStatic(physics, new Vector3(-6f, height * 0.5f, 8.6f + i * 0.55f),
-                new Vector3(4, height, 0.55f), PillarColor, checker: false);
+                new Vector3(4, height, 0.55f), PillarColor, checker: false, Surface.Metal);
         }
 
         // Free-standing cover blocks.
@@ -96,14 +103,23 @@ public sealed class Level
             AddCrate(physics, new Vector3(6f + i * 1.6f, 0.75f + i * 0.1f, 8f), 1.4f, 30f, new Vector4(0.55f, 0.5f, 0.3f, 1f));
     }
 
-    private void AddStatic(PhysicsWorld physics, Vector3 center, Vector3 size, Vector4 color, bool checker)
-        => AddStatic(physics, center, size, Quaternion.Identity, color, checker);
+    private void AddStatic(PhysicsWorld physics, Vector3 center, Vector3 size, Vector4 color, bool checker,
+        Surface surface = Surface.Concrete)
+        => AddStatic(physics, center, size, Quaternion.Identity, color, checker, surface);
 
-    private void AddStatic(PhysicsWorld physics, Vector3 center, Vector3 size, Quaternion orientation, Vector4 color, bool checker)
+    private void AddStatic(PhysicsWorld physics, Vector3 center, Vector3 size, Quaternion orientation, Vector4 color,
+        bool checker, Surface surface = Surface.Concrete)
     {
-        physics.AddStaticBox(center, size, orientation);
+        var handle = physics.AddStaticBox(center, size, orientation);
+        _surfaces[handle.Value] = surface;
         Statics.Add(new StaticProp(center, size, orientation, color, checker));
     }
+
+    /// <summary>Surface the given collidable is made of; anything unregistered is concrete.</summary>
+    public Surface SurfaceOf(CollidableReference collidable)
+        => collidable.Mobility == CollidableMobility.Static && _surfaces.TryGetValue(collidable.RawHandleValue, out var surface)
+            ? surface
+            : Surface.Concrete;
 
     private void AddCrate(PhysicsWorld physics, Vector3 center, float size, float mass, Vector4 color)
     {

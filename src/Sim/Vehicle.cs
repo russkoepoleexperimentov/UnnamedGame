@@ -102,6 +102,9 @@ public sealed class Vehicle
     /// <summary>Signed speed along the car's own forward axis, in m/s.</summary>
     public float ForwardSpeed => Vector3.Dot(Velocity, Forward);
 
+    /// <summary>How far the tyres are sliding sideways, in m/s, across all grounded wheels.</summary>
+    public float Slip { get; private set; }
+
     /// <param name="throttle">-1 (reverse) to 1 (accelerate).</param>
     /// <param name="steering">-1 (left) to 1 (right).</param>
     public void Update(float throttle, float steering, bool handbrake, float dt)
@@ -118,6 +121,7 @@ public sealed class Vehicle
         float targetSteer = -steering * MaxSteering * speedFactor;
 
         int groundedCount = 0;
+        float slip = 0f;
         for (int i = 0; i < _wheels.Length; i++)
         {
             ref var wheel = ref _wheels[i];
@@ -163,6 +167,7 @@ public sealed class Vehicle
 
             float lateralSpeed = Vector3.Dot(contactVelocity, side);
             float longitudinalSpeed = Vector3.Dot(contactVelocity, forward);
+            slip = MathF.Max(slip, MathF.Abs(lateralSpeed));
             float massShare = Mass / _wheels.Length;
 
             // Drive, brake and rolling resistance, as a force at this contact patch.
@@ -194,6 +199,8 @@ public sealed class Vehicle
 
             wheel.Spin += longitudinalSpeed / WheelRadius * dt;
         }
+
+        Slip = groundedCount > 0 ? slip : 0f;
 
         ApplyAntiRollBar(body, up, dt);
 

@@ -11,6 +11,7 @@ internal struct ClosestHitExcluding(CollidableReference self) : IRayHitHandler
     public float T = float.MaxValue;
     public Vector3 Normal;
     public bool Hit;
+    public CollidableReference Collidable;
 
     public readonly bool AllowTest(CollidableReference collidable) => collidable.Packed != self.Packed;
     public readonly bool AllowTest(CollidableReference collidable, int childIndex) => true;
@@ -22,6 +23,7 @@ internal struct ClosestHitExcluding(CollidableReference self) : IRayHitHandler
         T = t;
         Normal = normal;
         Hit = true;
+        Collidable = collidable;
         maximumT = t;   // let the broadphase prune everything further away
     }
 }
@@ -61,6 +63,8 @@ public sealed class Character
 
     public bool OnGround { get; private set; }
     public Vector3 GroundNormal { get; private set; } = Vector3.UnitY;
+    /// <summary>What the player is standing on, used to pick the footstep sound.</summary>
+    public CollidableReference GroundCollidable { get; private set; }
     public float Yaw;      // radians, 0 = looking down -Z
     public float Pitch;
 
@@ -336,12 +340,17 @@ public sealed class Character
     }
 
     private bool CastRay(Vector3 origin, Vector3 direction, float maximumT, out float t, out Vector3 normal)
+        => CastRay(origin, direction, maximumT, out t, out normal, out _);
+
+    private bool CastRay(Vector3 origin, Vector3 direction, float maximumT, out float t, out Vector3 normal,
+        out CollidableReference collidable)
     {
         var self = new CollidableReference(CollidableMobility.Dynamic, _handle);
         var handler = new ClosestHitExcluding(self);
         _physics.Simulation.RayCast(origin, direction, maximumT, _physics.BufferPool, ref handler, 0);
         t = handler.T;
         normal = handler.Normal;
+        collidable = handler.Collidable;
         return handler.Hit;
     }
 
@@ -349,9 +358,10 @@ public sealed class Character
     {
         // Cast from the capsule centre down past the bottom cap.
         float maximumT = CylinderHalfLength + Radius + 0.18f;
-        bool hit = CastRay(position, -Vector3.UnitY, maximumT, out _, out var normal);
+        bool hit = CastRay(position, -Vector3.UnitY, maximumT, out _, out var normal, out var collidable);
 
         OnGround = hit && normal.Y > MaxGroundSlopeCos;
+        if (OnGround) GroundCollidable = collidable;
         GroundNormal = OnGround ? Vector3.Normalize(normal) : Vector3.UnitY;
     }
 }

@@ -32,6 +32,15 @@ internal struct LightArray
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct GlassFrameData
+{
+    public Vector3 CameraPosition; public float Pad0;
+    public Vector3 SunDirection; public float SunIntensity;
+    public Vector3 SunColor; public float Pad1;
+    public Vector3 SkyColor; public float Pad2;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct LightingData
 {
     public Matrix4x4 InverseViewProjection;
@@ -63,6 +72,7 @@ public sealed class Renderer : IDisposable
 
     private static readonly Vector3 SunDirection = Vector3.Normalize(new Vector3(-0.55f, -0.52f, -0.4f));
     private static readonly Vector3 SunColor = new(0.95f, 0.82f, 0.72f);
+    private static readonly Vector3 SkyColor = new(0.20f, 0.25f, 0.34f);   // matches the lighting shader
     private const float SunIntensity = 0.5f;   // dusk: the dynamic lights are meant to carry the scene
 
     private readonly GameWindow _window;
@@ -77,16 +87,23 @@ public sealed class Renderer : IDisposable
     private readonly ID3D11PixelShader _lightingPS;
     private readonly ID3D11VertexShader _unlitVS;
     private readonly ID3D11PixelShader _unlitPS;
+    private readonly ID3D11VertexShader _glassVS;
+    private readonly ID3D11PixelShader _glassPS;
     private readonly ID3D11InputLayout _inputLayout;
 
     private readonly ID3D11Buffer _perPass;
     private readonly ID3D11Buffer _perObject;
     private readonly ID3D11Buffer _lighting;
+    private readonly ID3D11Buffer _glassFrame;
 
     private readonly ID3D11RasterizerState _rasterizer;
     private readonly ID3D11RasterizerState _shadowRasterizer;
     private readonly ID3D11DepthStencilState _depthState;
     private readonly ID3D11DepthStencilState _noDepthState;
+    private readonly ID3D11DepthStencilState _readOnlyDepthState;
+    private readonly ID3D11RasterizerState _noCullRasterizer;
+    private readonly ID3D11BlendState _alphaBlend;
+    private readonly List<(float Distance, DrawCommand Command)> _sortedGlass = [];
     private readonly ID3D11SamplerState _shadowSampler;
     private readonly ID3D11SamplerState _albedoSampler;
 
@@ -151,6 +168,8 @@ public sealed class Renderer : IDisposable
         using (var blob = Compile(Shaders.Lighting, "PSMain", "ps_5_0")) _lightingPS = _device.CreatePixelShader(blob.AsSpan());
         using (var blob = Compile(Shaders.Unlit, "VSMain", "vs_5_0")) _unlitVS = _device.CreateVertexShader(blob.AsSpan());
         using (var blob = Compile(Shaders.Unlit, "PSMain", "ps_5_0")) _unlitPS = _device.CreatePixelShader(blob.AsSpan());
+        using (var blob = Compile(Shaders.Glass, "VSMain", "vs_5_0")) _glassVS = _device.CreateVertexShader(blob.AsSpan());
+        using (var blob = Compile(Shaders.Glass, "PSMain", "ps_5_0")) _glassPS = _device.CreatePixelShader(blob.AsSpan());
 
         InputElementDescription[] elements =
         [
@@ -164,6 +183,7 @@ public sealed class Renderer : IDisposable
         _perPass = CreateConstantBuffer<PerPassData>();
         _perObject = CreateConstantBuffer<PerObjectData>();
         _lighting = CreateConstantBuffer<LightingData>();
+        _glassFrame = CreateConstantBuffer<GlassFrameData>();
 
         _rasterizer = _device.CreateRasterizerState(new RasterizerDescription
         {
@@ -182,8 +202,21 @@ public sealed class Renderer : IDisposable
             SlopeScaledDepthBias = 2.5f,
             DepthBiasClamp = 0.01f,
         });
+        _noCullRasterizer = _device.CreateRasterizerState(new RasterizerDescription
+        {
+            CullMode = CullMode.None,   // a window is seen from both sides
+            FillMode = FillMode.Solid,
+            DepthClipEnable = true,
+        });
+        _alphaBlend = _device.CreateBlendState(
+            new BlendDescription(Blend.SourceAlpha, Blend.InverseSourceAlpha));
+
         _depthState = _device.CreateDepthStencilState(
             new DepthStencilDescription(true, DepthWriteMask.All, ComparisonFunction.LessEqual));
+        // Glass tests against the opaque depth but must not write it, or the panes would
+        // occlude each other in whatever order they happen to be drawn.
+        _readOnlyDepthState = _device.CreateDepthStencilState(
+            new DepthStencilDescription(true, DepthWriteMask.Zero, ComparisonFunction.LessEqual));
         _noDepthState = _device.CreateDepthStencilState(
             new DepthStencilDescription(false, DepthWriteMask.Zero, ComparisonFunction.Always));
 
@@ -313,6 +346,7 @@ public sealed class Renderer : IDisposable
     /// <summary>Runs every pass for one frame and presents.</summary>
     public void RenderFrame(
         IReadOnlyList<DrawCommand> scene,
+        IReadOnlyList<DrawCommand> glass,
         IReadOnlyList<DrawCommand> overlay,
         IReadOnlyList<PointLight> pointLights,
         Spotlight? flashlight,
@@ -333,6 +367,7 @@ public sealed class Renderer : IDisposable
 
         GeometryPass(viewProjection, scene);
         LightingPass(viewProjection, sunViewProjection, spotViewProjection, pointLights, flashlight, cameraPosition);
+        GlassPass(viewProjection, glass, cameraPosition);
         OverlayPass(viewProjection, overlay);
 
         _swapChain.Present(1, PresentFlags.None);
@@ -436,6 +471,54 @@ public sealed class Renderer : IDisposable
         _context.Draw(3, 0);
     }
 
+    /// <summary>Forward pass for translucent surfaces, blended over the resolved image.</summary>
+    private void GlassPass(in Matrix4x4 viewProjection, IReadOnlyList<DrawCommand> glass, Vector3 cameraPosition)
+    {
+        if (glass.Count == 0) return;
+
+        // Sort back to front: alpha blending is order dependent.
+        _sortedGlass.Clear();
+        for (int i = 0; i < glass.Count; i++)
+        {
+            var centre = glass[i].World.Translation;
+            _sortedGlass.Add((Vector3.DistanceSquared(centre, cameraPosition), glass[i]));
+        }
+        _sortedGlass.Sort((a, b) => b.Distance.CompareTo(a.Distance));
+
+        Write(_glassFrame, new GlassFrameData
+        {
+            CameraPosition = cameraPosition,
+            SunDirection = SunDirection,
+            SunIntensity = SunIntensity,
+            SunColor = SunColor,
+            SkyColor = SkyColor,
+        });
+
+        // The depth buffer is still bound as an SRV from the lighting pass.
+        _context.PSSetShaderResources(0, [null, null, null, null, null]);
+        _context.OMSetRenderTargets(_backBufferView, _depthView);
+        _context.RSSetViewport(0, 0, _window.Width, _window.Height);
+        _context.RSSetState(_noCullRasterizer);
+        _context.OMSetDepthStencilState(_readOnlyDepthState);
+        _context.OMSetBlendState(_alphaBlend);
+
+        _context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+        _context.IASetInputLayout(_inputLayout);
+        _context.VSSetShader(_glassVS);
+        _context.PSSetShader(_glassPS);
+        _context.VSSetConstantBuffer(0, _perPass);
+        _context.VSSetConstantBuffer(1, _perObject);
+        _context.PSSetConstantBuffer(1, _perObject);
+        _context.PSSetConstantBuffer(2, _glassFrame);
+        _context.PSSetSampler(0, _albedoSampler);
+
+        Write(_perPass, new PerPassData { ViewProjection = viewProjection });
+        for (int i = 0; i < _sortedGlass.Count; i++)
+            DrawOne(_sortedGlass[i].Command, bindTextures: true);
+
+        _context.OMSetBlendState(null);
+    }
+
     private void OverlayPass(in Matrix4x4 viewProjection, IReadOnlyList<DrawCommand> overlay)
     {
         if (overlay.Count == 0) return;
@@ -458,8 +541,12 @@ public sealed class Renderer : IDisposable
     private void DrawAll(IReadOnlyList<DrawCommand> commands, bool bindTextures = false)
     {
         for (int i = 0; i < commands.Count; i++)
+            DrawOne(commands[i], bindTextures);
+    }
+
+    private void DrawOne(in DrawCommand command, bool bindTextures)
+    {
         {
-            var command = commands[i];
             bool textured = bindTextures && command.Texture is not null;
             Write(_perObject, new PerObjectData
             {
@@ -524,6 +611,9 @@ public sealed class Renderer : IDisposable
         _sunShadowView.Dispose();
         _sunShadowTexture.Dispose();
 
+        _alphaBlend.Dispose();
+        _noCullRasterizer.Dispose();
+        _readOnlyDepthState.Dispose();
         _albedoSampler.Dispose();
         _shadowSampler.Dispose();
         _noDepthState.Dispose();
@@ -531,11 +621,14 @@ public sealed class Renderer : IDisposable
         _shadowRasterizer.Dispose();
         _rasterizer.Dispose();
 
+        _glassFrame.Dispose();
         _lighting.Dispose();
         _perObject.Dispose();
         _perPass.Dispose();
 
         _inputLayout.Dispose();
+        _glassPS.Dispose();
+        _glassVS.Dispose();
         _unlitPS.Dispose();
         _unlitVS.Dispose();
         _lightingPS.Dispose();
