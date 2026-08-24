@@ -124,6 +124,20 @@ public sealed class PhysicsWorld : IDisposable
         return Simulation.Bodies.Add(description);
     }
 
+    /// <summary>
+    /// Adds a static triangle mesh, which is how terrain gets its collision: Bepu keeps its own
+    /// acceleration structure over the triangles, so a big patch is still cheap to query.
+    /// </summary>
+    public StaticHandle AddStaticMesh(Vector3 position, Span<Triangle> triangles)
+    {
+        BufferPool.Take<Triangle>(triangles.Length, out var buffer);
+        for (int i = 0; i < triangles.Length; i++) buffer[i] = triangles[i];
+
+        var mesh = new BepuPhysics.Collidables.Mesh(buffer.Slice(0, triangles.Length), Vector3.One, BufferPool);
+        var shape = Simulation.Shapes.Add(mesh);
+        return Simulation.Statics.Add(new StaticDescription(position, Quaternion.Identity, shape));
+    }
+
     /// <summary>True if anything at all is hit along the ray.</summary>
     public bool RayCastAny(Vector3 origin, Vector3 direction, float maximumT)
     {

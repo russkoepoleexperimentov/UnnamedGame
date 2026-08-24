@@ -38,6 +38,8 @@ public sealed class Game : IDisposable
     private readonly List<RenderModel.Part> _carBodyParts = [];
     private readonly List<RenderModel.Part>[] _carWheelParts = [[], [], [], []];
     private readonly List<RenderModel.Part> _carGlassParts = [];
+    private readonly List<(Mesh Mesh, Vector4 Color, float Scale, Texture Albedo, Texture Normal)> _terrain = [];
+    private readonly Dictionary<string, Texture> _groundTextures = [];
     private bool _driving;
 
     private readonly List<DrawCommand> _scene = [];
@@ -63,13 +65,28 @@ public sealed class Game : IDisposable
     private float _fpsTimer;
     private int _frameCount;
 
-    public Game()
+    /// <param name="mapPath">Map to play; defaults to the shipped courtyard.</param>
+    public Game(string mapPath = null)
     {
         _window = new GameWindow("UnnamedGame — MVP", 1280, 720);
         _renderer = new Renderer(_window);
         _physics = new PhysicsWorld(new Vector3(0, -18f, 0));
-        _level = new Level(_physics);
+        _level = new Level(_physics, LoadMap(mapPath));
         _player = new Character(_physics, _level.SpawnPoint);
+
+        foreach (var patch in _level.Map.Terrains)
+        {
+            var albedo = GroundTexture(patch.Texture);
+
+            // A textured patch is drawn as the texture is; the colour only stands in when
+            // there is no texture, so an old map's tint cannot dye the ground green.
+            _terrain.Add((
+                _renderer.CreateTerrainMesh(patch),
+                albedo is null ? new Vector4(patch.Color, 1f) : Vector4.One,
+                MathF.Max(patch.TextureScale, 0.1f),
+                albedo,
+                albedo is null ? null : GroundTexture(patch.Texture + "_normal")));
+        }
 
         _font = _renderer.CreateFont();
         _ui = new UiBatch(_font);
@@ -135,7 +152,8 @@ public sealed class Game : IDisposable
         for (int i = 0; i < 4; i++)
             anchors[i] = new Vector3(hubs[i].X, 0f, hubs[i].Z);
 
-        return new Vehicle(_physics, new Vector3(6.5f, centreHeight + 0.05f, 11f), 0.35f, anchors, centreHeight);
+        var spawn = _level.Map.CarSpawn with { Y = centreHeight + 0.05f };
+        return new Vehicle(_physics, spawn, _level.Map.CarYaw, anchors, centreHeight);
     }
 
     private static int WheelIndex(string nodeName) => nodeName switch
@@ -192,6 +210,18 @@ public sealed class Game : IDisposable
             else { _player.Teleport(target); _console.Print($"teleported to {Format(target)}"); }
         }, "move the player to a position");
 
+        _console.RegisterCommand("look", args =>
+        {
+            if (args.Length < 3) { _console.PrintError("usage: look <yaw> <pitch> (degrees)"); return; }
+            const float toRadians = MathF.PI / 180f;
+            float yaw = ParseFloat(args[1]) * toRadians;
+            float pitch = Math.Clamp(ParseFloat(args[2]) * toRadians, -1.5f, 1.5f);
+
+            if (_driving) { _carLookYaw = yaw; _carLookPitch = pitch; }
+            else { _player.Yaw = yaw; _player.Pitch = pitch; }
+            _console.Print($"looking {args[1]} / {args[2]} deg");
+        }, "point the camera (degrees)");
+
         _console.RegisterCommand("respawn", _ =>
         {
             if (_driving) ToggleVehicle();
@@ -238,6 +268,44 @@ public sealed class Game : IDisposable
             var position = _driving ? _car.Position : _player.Position;
             _console.Print($"{(_driving ? "car" : "player")} {Format(position)}  yaw {_player.Yaw:F2}");
         }, "print the current position");
+    }
+
+    /// <summary>Ground textures live in assets/textures/ground and are shared between patches.</summary>
+    private Texture GroundTexture(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return null;
+        if (_groundTextures.TryGetValue(name, out var cached)) return cached;
+
+        string path = AssetPaths.Get("textures", "ground", name + ".png");
+        if (!File.Exists(path))
+        {
+            Console.WriteLine($"ground texture '{name}' not found, falling back to a flat colour");
+            _groundTextures[name] = null;
+            return null;
+        }
+
+        var texture = _renderer.LoadTexture(path);
+        _groundTextures[name] = texture;
+        return texture;
+    }
+
+    /// <summary>
+    /// Loads the map the editor writes; falls back to the built-in courtyard, and writes it out
+    /// the first time so there is always something to open in the editor.
+    /// </summary>
+    private static MapData LoadMap(string mapPath)
+    {
+        string path = mapPath ?? AssetPaths.Get("maps", "courtyard.ugmap");
+        if (File.Exists(path))
+        {
+            try { return MapData.Load(path); }
+            catch (Exception exception) { Console.WriteLine($"map load failed ({exception.Message}); using the built-in one"); }
+        }
+
+        var map = Level.CreateDefaultMap();
+        try { map.Save(path); Console.WriteLine($"wrote {path}"); }
+        catch (Exception exception) { Console.WriteLine($"could not write {path}: {exception.Message}"); }
+        return map;
     }
 
     /// <summary>Runs config.cfg at startup, creating a starter one the first time.</summary>
@@ -476,6 +544,12 @@ public sealed class Game : IDisposable
         _scene.Clear();
         _glass.Clear();
 
+        foreach (var (mesh, color, scale, albedo, normal) in _terrain)
+        {
+            _scene.Add(new DrawCommand(mesh, Matrix4x4.Identity, color, new Vector3(scale),
+                Checker: albedo is null, albedo, normal));
+        }
+
         foreach (var prop in _level.Statics)
         {
             var world = Matrix4x4.CreateScale(prop.Size)
@@ -656,6 +730,8 @@ public sealed class Game : IDisposable
 
     public void Dispose()
     {
+        foreach (var entry in _terrain) entry.Mesh.Dispose();
+        foreach (var texture in _groundTextures.Values) texture?.Dispose();
         _console.SaveConfig(AssetPaths.ConfigFile);
         _font.Dispose();
         _sounds.Dispose();

@@ -284,6 +284,12 @@ public sealed class Renderer : IDisposable
         SphereMesh = Mesh.CreateSphere(_device);
     }
 
+    /// <summary>Loads a texture straight from a file, for terrain ground materials.</summary>
+    public Texture LoadTexture(string path) => Texture.Load(_device, _context, path);
+
+    /// <summary>Builds the render mesh for one terrain patch.</summary>
+    public Mesh CreateTerrainMesh(Sim.MapTerrain terrain) => Mesh.CreateTerrain(_device, terrain);
+
     /// <summary>Bakes the console/overlay font atlas.</summary>
     public FontAtlas CreateFont() => new(_device, _context);
 

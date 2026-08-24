@@ -8,10 +8,18 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
+    <!-- Same path whether built from the solution or the project alone. -->
+    <OutputPath>bin\$(Configuration)\</OutputPath>
     <RootNamespace>UnnamedGame</RootNamespace>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The editor is a separate application in editor\; keep its sources out of the game. -->
+    <Compile Remove="editor\**" />
+    <None Remove="editor\**" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="BepuPhysics" Version="2.5.0-beta.29" />

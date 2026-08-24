@@ -13,12 +13,29 @@ public static class AssetPaths
 
     private static string Locate()
     {
+        var candidates = new List<string>();
+
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         for (int depth = 0; depth < 8 && directory is not null; depth++, directory = directory.Parent)
         {
             string candidate = Path.Combine(directory.FullName, "assets");
-            if (Directory.Exists(candidate)) return candidate;
+            if (Directory.Exists(candidate)) candidates.Add(candidate);
         }
-        throw new DirectoryNotFoundException("Could not find the 'assets' directory above the executable.");
+
+        if (candidates.Count == 0)
+            throw new DirectoryNotFoundException("Could not find the 'assets' directory above the executable.");
+
+        // In a source tree a copy of the assets can end up inside bin\, and taking the nearest
+        // one would silently shadow the real folder. The one sitting next to the project files
+        // is the authoritative copy; a deployed build has only one candidate anyway.
+        foreach (var candidate in candidates)
+        {
+            var parent = Directory.GetParent(candidate);
+            if (parent is null) continue;
+            if (parent.EnumerateFiles("*.sln").Any() || parent.EnumerateFiles("*.csproj").Any())
+                return candidate;
+        }
+
+        return candidates[0];
     }
 }

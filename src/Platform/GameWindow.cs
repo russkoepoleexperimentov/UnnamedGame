@@ -20,8 +20,18 @@ public sealed class GameWindow
 
     public float MouseDeltaX { get; private set; }
     public float MouseDeltaY { get; private set; }
+
+    /// <summary>Cursor position in client pixels, for the editor's viewport hit testing.</summary>
+    public int MouseX { get; private set; }
+    public int MouseY { get; private set; }
+
+    /// <summary>Wheel notches this frame; positive is away from the user.</summary>
+    public float WheelDelta { get; private set; }
     private float _accumX, _accumY;
-    private bool _lmbDown, _lmbPressed;
+    private readonly bool[] _buttonDown = new bool[3];
+    private readonly bool[] _buttonPressed = new bool[3];
+    private readonly bool[] _buttonReleased = new bool[3];
+    private float _wheelAccum;
 
     public GameWindow(string title, int width, int height)
     {
@@ -62,15 +72,22 @@ public sealed class GameWindow
 
     public bool IsKeyDown(int vk) => _down[vk & 0xFF];
     public bool WasKeyPressed(int vk) => _pressed[vk & 0xFF];
-    public bool WasMousePressed() => _lmbPressed;
+
+    /// <summary>0 = left, 1 = right, 2 = middle.</summary>
+    public bool IsMouseDown(int button) => _buttonDown[button];
+    public bool WasMousePressed(int button) => _buttonPressed[button];
+    public bool WasMouseReleased(int button) => _buttonReleased[button];
+    public bool WasMousePressed() => _buttonPressed[0];
 
     public void PumpEvents()
     {
         Array.Clear(_pressed);
+        Array.Clear(_buttonPressed);
+        Array.Clear(_buttonReleased);
         _typed.Clear();
-        _lmbPressed = false;
         Resized = false;
         _accumX = _accumY = 0;
+        _wheelAccum = 0;
 
         while (PeekMessage(out var msg, IntPtr.Zero, 0, 0, PM_REMOVE))
         {
@@ -80,8 +97,15 @@ public sealed class GameWindow
 
         MouseDeltaX = _accumX;
         MouseDeltaY = _accumY;
+        WheelDelta = _wheelAccum;
         if (MouseCaptured) ConfineCursor();
     }
+
+    /// <summary>Puts a new caption on the window; the editor shows the open file there.</summary>
+    public void SetTitle(string title) => Win32.SetWindowText(Handle, title);
+
+    /// <summary>Takes back a close request, so an editor can ask about unsaved work first.</summary>
+    public void CancelClose() => IsClosed = false;
 
     /// <summary>Asks the game loop to shut down (the console "quit" command).</summary>
     public void Close()
@@ -109,6 +133,20 @@ public sealed class GameWindow
         ClipCursor(ref screen);
     }
 
+    private IntPtr ButtonDown(int button)
+    {
+        if (!_buttonDown[button]) _buttonPressed[button] = true;
+        _buttonDown[button] = true;
+        return IntPtr.Zero;
+    }
+
+    private IntPtr ButtonUp(int button)
+    {
+        if (_buttonDown[button]) _buttonReleased[button] = true;
+        _buttonDown[button] = false;
+        return IntPtr.Zero;
+    }
+
     private unsafe IntPtr HandleMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam)
     {
         switch (msg)
@@ -131,8 +169,18 @@ public sealed class GameWindow
                 return IntPtr.Zero;
             }
 
+            case WM_MOUSEMOVE:
+                MouseX = (short)((long)lParam & 0xFFFF);
+                MouseY = (short)(((long)lParam >> 16) & 0xFFFF);
+                return IntPtr.Zero;
+
+            case WM_MOUSEWHEEL:
+                _wheelAccum += (short)(((long)wParam >> 16) & 0xFFFF) / 120f;
+                return IntPtr.Zero;
+
             case WM_KILLFOCUS:
                 Array.Clear(_down);
+                Array.Clear(_buttonDown);
                 SetMouseCapture(false);
                 return IntPtr.Zero;
 
@@ -154,14 +202,12 @@ public sealed class GameWindow
                 _down[(int)wParam & 0xFF] = false;
                 return IntPtr.Zero;
 
-            case WM_LBUTTONDOWN:
-                if (!_lmbDown) _lmbPressed = true;
-                _lmbDown = true;
-                return IntPtr.Zero;
-
-            case WM_LBUTTONUP:
-                _lmbDown = false;
-                return IntPtr.Zero;
+            case WM_LBUTTONDOWN: return ButtonDown(0);
+            case WM_LBUTTONUP: return ButtonUp(0);
+            case WM_RBUTTONDOWN: return ButtonDown(1);
+            case WM_RBUTTONUP: return ButtonUp(1);
+            case WM_MBUTTONDOWN: return ButtonDown(2);
+            case WM_MBUTTONUP: return ButtonUp(2);
 
             case WM_INPUT:
             {

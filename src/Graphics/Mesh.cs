@@ -60,6 +60,39 @@ public sealed class Mesh : IDisposable
         return new Mesh(device, [.. vertices], [.. indices]);
     }
 
+    /// <summary>Grid mesh for one terrain patch, with normals taken from the height field.</summary>
+    public static Mesh CreateTerrain(ID3D11Device device, Sim.MapTerrain terrain)
+    {
+        var vertices = new Vertex[terrain.Columns * terrain.Rows];
+        for (int row = 0; row < terrain.Rows; row++)
+        {
+            for (int column = 0; column < terrain.Columns; column++)
+            {
+                vertices[row * terrain.Columns + column] = new Vertex(
+                    terrain.Vertex(column, row),
+                    terrain.Normal(column, row),
+                    new Vector2(column, row));
+            }
+        }
+
+        var indices = new uint[(terrain.Columns - 1) * (terrain.Rows - 1) * 6];
+        int index = 0;
+        for (int row = 0; row < terrain.Rows - 1; row++)
+        {
+            for (int column = 0; column < terrain.Columns - 1; column++)
+            {
+                uint a = (uint)(row * terrain.Columns + column);
+                uint b = a + 1;
+                uint c = a + (uint)terrain.Columns;
+                uint d = c + 1;
+                indices[index++] = a; indices[index++] = b; indices[index++] = c;
+                indices[index++] = b; indices[index++] = d; indices[index++] = c;
+            }
+        }
+
+        return new Mesh(device, vertices, indices);
+    }
+
     /// <summary>Unit-radius UV sphere.</summary>
     public static Mesh CreateSphere(ID3D11Device device, int slices = 20, int stacks = 12)
     {

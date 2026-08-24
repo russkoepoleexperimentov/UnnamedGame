@@ -1,6 +1,7 @@
 namespace UnnamedGame.Graphics;
 
-internal static class Shaders
+/// <summary>Public so the editor can reuse the 2D text pipeline.</summary>
+public static class Shaders
 {
     public const int MaxPointLights = 16;
 
@@ -25,8 +26,8 @@ internal static class Shaders
     {
         row_major float4x4 World;
         float4   Color;
-        float3   TexScale;   // world units per checker tile
-        float    Checker;    // 0 = flat color, 1 = checkered, 2 = sample AlbedoTexture
+        float3   TexScale;   // world units per checker tile, or per texture tile in mode 3
+        float    Checker;    // 0 flat, 1 checker, 2 textured (alpha tested), 3 ground: texture + normal map
     };
 
     struct VSIn { float3 Position : POSITION; float3 Normal : NORMAL; float2 Uv : TEXCOORD0; };
@@ -36,6 +37,7 @@ internal static class Shaders
     public static readonly string GBuffer = Common + """
 
     Texture2D<float4> AlbedoTexture : register(t0);
+    Texture2D<float4> NormalTexture : register(t1);
     SamplerState AlbedoSampler : register(s0);
 
     struct VSOut
@@ -68,7 +70,21 @@ internal static class Shaders
         float3 n = normalize(input.Normal);
         float3 albedo = Color.rgb;
 
-        if (Checker > 1.5)
+        if (Checker > 2.5)
+        {
+            // Ground: tiled from world position, so the tiling never depends on how finely the
+            // height field happens to be divided.
+            float2 uv = input.WorldPos.xz / max(TexScale.x, 0.01);
+            albedo *= AlbedoTexture.Sample(AlbedoSampler, uv).rgb;
+
+            // A height field's tangent frame is just the world axes bent onto the surface, so
+            // no per-vertex tangents are needed to apply the normal map.
+            float3 tangent = normalize(float3(1, 0, 0) - n * n.x);
+            float3 bitangent = cross(n, tangent);
+            float3 sampled = NormalTexture.Sample(AlbedoSampler, uv).xyz * 2.0 - 1.0;
+            n = normalize(tangent * sampled.x + bitangent * sampled.y + n * max(sampled.z, 0.05));
+        }
+        else if (Checker > 1.5)
         {
             // Textured model surface: the material colour tints the sampled albedo.
             float4 sampled = AlbedoTexture.Sample(AlbedoSampler, input.Uv);

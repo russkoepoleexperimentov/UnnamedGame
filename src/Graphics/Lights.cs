@@ -40,4 +40,5 @@ public readonly record struct DrawCommand(
     Vector4 Color,
     Vector3 TexScale,
     bool Checker,
-    Texture Texture = null);
+    Texture Texture = null,
+    Texture NormalMap = null);

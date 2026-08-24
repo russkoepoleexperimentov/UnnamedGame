@@ -14,5 +14,6 @@ Console.WriteLine("""
       Esc       release the mouse (click the window to capture it)
     """);
 
-using var game = new Game();
+// An optional map path, so a level being edited can be played without copying files around.
+using var game = new Game(args.Length > 0 ? args[0] : null);
 game.Run();
